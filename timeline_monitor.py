@@ -139,11 +139,14 @@ def is_within_7_days(created_at_str: str) -> bool:
     if not created_at_str:
         return True  # fallback: assume recent
     try:
-        # Parse ISO datetime
+        # Parse ISO datetime (Twitter uses UTC with Z suffix)
         created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
-        now = datetime.utcnow()
-        return (now - created_at) <= timedelta(days=MAX_AGE_DAYS)
-    except Exception:
+        # Strip timezone info for naive comparison with utcnow
+        created_at_utc = created_at.replace(tzinfo=None)
+        now_utc = datetime.utcnow()
+        return (now_utc - created_at_utc) <= timedelta(days=MAX_AGE_DAYS)
+    except Exception as e:
+        logger.warning(f"is_within_7_days parse error: {e}")
         return True
 
 
