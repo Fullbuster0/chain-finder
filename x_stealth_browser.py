@@ -24,7 +24,7 @@ class XStealthBrowser:
         user_agent: Optional[str] = None,
         viewport: Optional[Dict[str, int]] = None,
         proxy: Optional[Dict[str, str]] = None,
-        timeout: int = 30000,
+        timeout: int = 60000,
         slow_mo: int = 50,
     ):
         self.cookie_file = Path(cookie_file)
@@ -138,7 +138,7 @@ class XStealthBrowser:
 
     async def _ensure_logged_in(self):
         """Navigate to X and ensure cookies are valid (logged in)."""
-        await self.page.goto("https://x.com/home", wait_until="networkidle")
+        await self.page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=60000)
         # Check if we are on login page or home page
         if "/login" in self.page.url or "/i/flow/login" in self.page.url:
             logger.warning("Not logged in or cookies expired. Please refresh cookies.")
@@ -148,7 +148,7 @@ class XStealthBrowser:
 
     async def navigate_to_user(self, username: str):
         """Navigate to a user's profile."""
-        await self.page.goto(f"https://x.com/{username}", wait_until="networkidle")
+        await self.page.goto(f"https://x.com/{username}", wait_until="domcontentloaded", timeout=60000)
         await self._random_delay(0.5, 1.5)
 
     async def fetch_timeline(self, username: str, limit: int = 20) -> List[Dict]:
