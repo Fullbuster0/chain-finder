@@ -1,0 +1,29 @@
+# Sensitive files
+x_cookies.txt
+*.log
+*.json
+!package.json
+!package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime
+*.session
+*.db
+*.sqlite
