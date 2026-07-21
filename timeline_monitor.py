@@ -197,13 +197,18 @@ async def _fetch_timeline_async(account: str, max_posts: int = 10) -> List[Dict]
                 const results = [];
                 for (const article of articles) {
                     if (results.length >= limit) break;
-                    const id = article.getAttribute('data-tweet-id') || '';
+                    const linkElem = article.querySelector('a[href*="/status/"]');
+                    const permalink = linkElem ? linkElem.getAttribute('href') : '';
+                    const match = permalink.match(/\\/status\\/(\\d+)/);
+                    const id = match ? match[1] : '';
+                    // **FILTER KETAT**: hanya tweet dari akun target, bukan retweet/quote dari akun lain
+                    const userMatch = permalink.match(/^\\/(\\w+)\\/status\\//);
+                    const actualUser = userMatch ? userMatch[1] : '';
+                    if (id && actualUser !== account) continue;
                     const text = article.querySelector('[data-testid="tweetText"]')?.innerText || '';
                     const user = article.querySelector('[data-testid="User-Name"]')?.innerText || '';
                     const timeElem = article.querySelector('time');
                     const created_at = timeElem ? timeElem.getAttribute('datetime') : '';
-                    const linkElem = article.querySelector('a[href*="/status/"]');
-                    const permalink = linkElem ? linkElem.getAttribute('href') : '';
                     if (id) {
                         results.push({ id, text, user, created_at, permalink });
                     }
@@ -256,12 +261,15 @@ def perform_action(agent, post: Dict) -> bool:
     if not tweet_url:
         logger.error("No URL for post")
         return False
+    
+    # Extract tweet ID from URL (last path segment)
+    tweet_id = tweet_url.rstrip("/").split("/")[-1]
 
     # Like with retry
     like_success = False
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            agent.like_tweet(tweet_url=tweet_url)
+            run_sync(agent.like_tweet(tweet_id=tweet_id))
             logger.info(f"Liked: {tweet_url}")
             like_success = True
             break
@@ -283,7 +291,7 @@ def perform_action(agent, post: Dict) -> bool:
         quote_success = False
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
-                agent.quote_tweet(tweet_url=tweet_url, quote_text=quote_text[:280])
+                run_sync(agent.quote_tweet(tweet_id=tweet_id, text=quote_text[:280]))
                 logger.info(f"Quoted: {tweet_url} with: {quote_text[:50]}...")
                 quote_success = True
                 break
@@ -299,7 +307,7 @@ def perform_action(agent, post: Dict) -> bool:
             # Fallback to retweet with retry
             for attempt in range(1, RETRY_ATTEMPTS + 1):
                 try:
-                    agent.retweet_tweet(tweet_url=tweet_url)
+                    run_sync(agent.retweet_tweet(tweet_id=tweet_id))
                     logger.info(f"Retweeted: {tweet_url}")
                     return True
                 except Exception as e:
@@ -312,7 +320,7 @@ def perform_action(agent, post: Dict) -> bool:
         # No quote, just retweet with retry
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
-                agent.retweet_tweet(tweet_url=tweet_url)
+                run_sync(agent.retweet_tweet(tweet_id=tweet_id))
                 logger.info(f"Retweeted: {tweet_url}")
                 return True
             except Exception as e:
@@ -336,28 +344,48 @@ def process_queue():
         logger.info("Outside active hours. Will still enqueue but not process actions.")
         return
 
-    # Perform actions
-    with XStealthBrowser(cookie_file=COOKIES_PATH, headless=True) as browser:
-        # We need to wrap in a context manager properly; we'll use run_sync to call async methods
-        # But XStealthBrowser is async, so we use a sync wrapper
-        def _process():
-            browser.start()
-            processed = 0
-            for _ in range(num_actions):
-                if not queue:
-                    break
-                post = queue.pop(0)
-                success = perform_action(browser, post)
-                if success:
+    processed = 0
+    for _ in range(num_actions):
+        if not queue:
+            break
+        post = queue.pop(0)
+        success = False
+        # Retry browser creation/action up to 3 times
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            browser = XStealthBrowser(cookie_file=COOKIES_PATH, headless=True)
+            try:
+                run_sync(browser.start())
+                # Perform action (like+quote/retweet)
+                action_success = run_sync(perform_action(browser, post))
+                if action_success:
+                    logger.info(f"Action succeeded for {post.get('url')}")
+                    success = True
                     processed += 1
-                    # Notify (log only)
                     notify_telegram(post, action="liked+quoted/retweeted")
+                    break
                 else:
-                    logger.warning(f"Action failed for {post.get('url')}, discarding.")
-                time.sleep(random.uniform(ACTION_DELAY_MIN, ACTION_DELAY_MAX))
-            save_queue(queue)
-            logger.info(f"Processed {processed} actions.")
-        run_sync(_process())
+                    logger.warning(f"Action returned failure for {post.get('url')}")
+                    break  # no point retrying browser if action itself failed
+            except Exception as e:
+                logger.error(f"Browser/action error (attempt {attempt}): {e}")
+                if attempt < RETRY_ATTEMPTS:
+                    delay = RETRY_DELAY * (2 ** (attempt - 1))
+                    logger.info(f"Retrying in {delay}s with fresh browser...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"All retries failed for {post.get('url')}")
+            finally:
+                try:
+                    run_sync(browser.stop())
+                except Exception as e:
+                    logger.error(f"Error stopping browser: {e}")
+        if not success:
+            logger.warning(f"Action permanently failed for {post.get('url')}, discarding.")
+        # Delay between actions
+        time.sleep(random.uniform(ACTION_DELAY_MIN, ACTION_DELAY_MAX))
+
+    save_queue(queue)
+    logger.info(f"Processed {processed} actions.")
 
 
 def notify_telegram(post: Dict, action: str):
