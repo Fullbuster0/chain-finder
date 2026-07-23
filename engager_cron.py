@@ -1,25 +1,28 @@
 #!/home/hermes/.hermes/hermes-agent/venv/bin/python3
 """
-quote_cron.py — Engage original root posts from Cosmos target accounts.
-Separate from like_retweet_cron.py — does NOT modify or share state with it.
+engager_cron.py — Single unified X engager for Cosmos target accounts.
 
-Engagement priority per tweet:
+ONE action stack per tweet (never both quote AND retweet on the same post):
   1. Always like
   2. Prefer LLM-generated quote (natural, contextual — reads tweet body)
   3. Fallback plain retweet if LLM fails / quote UI fails
   (Never posts template/canned quote text.)
 
-Anti double-quote (layers):
-  - flock on quote_cron.lock → only one process at a time
-  - quote_queue.json: processed[] + claimed{} (claim-before-act, TTL 2h)
+Replaces dual-script setup (like_retweet_cron + quote_cron). like_retweet_cron.py
+is kept on disk for future mods/reference but should NOT be scheduled.
+
+Anti double-engage (layers):
+  - flock on engager_cron.lock → only one process at a time
+  - engager_queue.json: processed[] + claimed{} (claim-before-act, TTL 2h)
   - atomic save (temp + os.replace)
-  - UI guard: data-testid=unretweet → already engaged, skip re-quote
+  - UI guard: data-testid=unretweet → already engaged, skip re-action
   - discovery skips processed + claimed + skip_reply
+  - quote XOR retweet — never both on the same post
 
 Flow:
-- Discover via profile + search (same dual-scan as like_retweet)
+- Discover via profile + search (same dual-scan as old like_retweet)
 - Only original root tweets by target account (never replies / pure reposts)
-- State in quote_queue.json (separate from timeline_queue.json)
+- State in engager_queue.json
 - TG thread 10 notification
 """
 import asyncio
@@ -40,8 +43,14 @@ from playwright_stealth import Stealth
 COOKIE_FILE = "/home/hermes/chain-finder/x_cookies.txt"
 ACCOUNTS = ['_atomone', 'Hippo_Protocol', 'ShentuChain', 'phoenix_dir', 'ZetaChain', '_gnoland']
 MAX_DAYS = 7
-STATE_FILE = "/home/hermes/chain-finder/quote_queue.json"
-LOCK_FILE = "/home/hermes/chain-finder/quote_cron.lock"
+STATE_FILE = "/home/hermes/chain-finder/engager_queue.json"
+LOCK_FILE = "/home/hermes/chain-finder/engager_cron.lock"
+# Legacy state files — merged into engager_queue on first load so we never
+# re-engage posts already handled by the old like_retweet / quote scripts.
+LEGACY_STATE_FILES = [
+    "/home/hermes/chain-finder/timeline_queue.json",
+    "/home/hermes/chain-finder/quote_queue.json",
+]
 BRIDGE_CONFIG = "/home/hermes/.hermes/bridge_config.json"
 TELEGRAM_CHAT_ID = "-1003641668106"
 TELEGRAM_THREAD = "10"
@@ -64,7 +73,7 @@ def is_active_hours():
 
 
 def acquire_run_lock():
-    """Exclusive flock so two quote_cron processes never act on the same post."""
+    """Exclusive flock so two engager_cron processes never act on the same post."""
     global _lock_fh
     if _lock_fh is not None:
         return True  # already holding in this process
@@ -74,7 +83,7 @@ def acquire_run_lock():
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         fh.close()
-        logger.error("Another quote_cron is running (lock held). Exit.")
+        logger.error("Another engager_cron is running (lock held). Exit.")
         return False
     fh.seek(0)
     fh.truncate()
@@ -134,26 +143,57 @@ def _prune_state(data):
 
 
 def load_state():
+    """Load engager state, merging any legacy like_retweet/quote history once."""
     if not os.path.exists(STATE_FILE):
-        return _empty_state()
-    with open(STATE_FILE) as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        state = {
-            "processed": [t.get('id') for t in data if t.get('id')],
-            "skip_reply": [],
-            "claimed": {},
-        }
-        save_state(state)
-        return state
-    return _prune_state(data)
+        data = _empty_state()
+    else:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            data = {
+                "processed": [t.get('id') for t in data if t.get('id')],
+                "skip_reply": [],
+                "claimed": {},
+            }
+        data = _prune_state(data)
+
+    # Absorb legacy processed/skip so we never re-engage old posts
+    processed = set(str(x) for x in data.get('processed', []))
+    skip = set(str(x) for x in data.get('skip_reply', []))
+    absorbed = 0
+    for path in LEGACY_STATE_FILES:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                legacy = json.load(f)
+            if isinstance(legacy, list):
+                ids = [str(t.get('id')) for t in legacy if t.get('id')]
+                skip_ids = []
+            else:
+                ids = [str(x) for x in legacy.get('processed', [])]
+                skip_ids = [str(x) for x in legacy.get('skip_reply', [])]
+            before = len(processed) + len(skip)
+            processed.update(ids)
+            skip.update(skip_ids)
+            absorbed += (len(processed) + len(skip)) - before
+        except Exception as e:
+            logger.warning(f"legacy state merge fail {path}: {e}")
+    if absorbed:
+        logger.info(f"merged {absorbed} legacy ids into engager state")
+    data['processed'] = list(processed)
+    data['skip_reply'] = list(skip)
+    data = _prune_state(data)
+    # Persist merged state so next load is cheap
+    save_state(data)
+    return data
 
 
 def save_state(state):
     """Atomic write: temp file + os.replace so crash mid-write can't corrupt JSON."""
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     dirn = os.path.dirname(STATE_FILE) or '.'
-    fd, tmp = tempfile.mkstemp(prefix='.quote_queue.', suffix='.tmp', dir=dirn)
+    fd, tmp = tempfile.mkstemp(prefix='.engager_queue.', suffix='.tmp', dir=dirn)
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(state, f, indent=2)
@@ -837,7 +877,7 @@ async def main():
     browser = None
     p = None
     try:
-        logger.info("=== quote_cron start ===")
+        logger.info("=== engager_cron start ===")
         state = load_state()
         processed_ids = set(str(x) for x in state.get("processed", []))
         claimed_ids = set(str(x) for x in state.get("claimed", {}).keys())
