@@ -5,6 +5,7 @@ Uses Playwright browser-search (same engine as like_retweet_cron).
 Searches keywords, notifies Telegram thread 9 with new mentions.
 """
 import asyncio
+import html
 import json
 import logging
 import os
@@ -18,9 +19,10 @@ from playwright_stealth import Stealth
 
 BASE_DIR = Path("/home/hermes/chain-finder")
 COOKIE_FILE = BASE_DIR / "x_cookies.txt"
-SEEN_FILE = BASE_DIR / "chain_finder_seen.json"
-LOG_FILE = BASE_DIR / "chain_finder_x.log"
+# Active seen-state (IDs only). Legacy chain_finder_seen.json is merged once on load.
 STATE_FILE = BASE_DIR / "chain_finder_x_state.json"
+LEGACY_SEEN_FILE = BASE_DIR / "chain_finder_seen.json"
+LOG_FILE = BASE_DIR / "chain_finder_x.log"
 
 KEYWORDS = [
     "becoming validator",
@@ -35,6 +37,7 @@ KEYWORDS = [
 MAX_AGE_DAYS = 7
 MAX_TWEETS_PER_KEYWORD = 10
 MAX_POSTS = 5  # max notifications per run
+MAX_SEEN = 2000  # hard cap after prune
 
 # Telegram
 TG_CHAT_ID = "-1003641668106"
@@ -76,17 +79,66 @@ def load_cookies():
     return cookies
 
 
+def snowflake_to_dt(tid):
+    try:
+        timestamp_ms = (int(tid) >> 22) + 1288834974657
+        return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
+def _prune_seen(seen_ids):
+    """Keep only IDs younger than MAX_AGE_DAYS; cap at MAX_SEEN (newest first)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
+    kept = []
+    for tid in seen_ids:
+        dt = snowflake_to_dt(tid)
+        if dt is None or dt >= cutoff:
+            kept.append(str(tid))
+    # Newest snowflakes are larger — keep the tail if still over cap
+    if len(kept) > MAX_SEEN:
+        kept = sorted(kept, key=lambda x: int(x) if str(x).isdigit() else 0)[-MAX_SEEN:]
+    return kept
+
+
 def load_state():
     if STATE_FILE.exists():
         try:
             with open(STATE_FILE) as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception:
-            pass
-    return {"seen": []}
+            data = {"seen": []}
+    else:
+        data = {"seen": []}
+
+    seen = set(str(x) for x in data.get("seen", []))
+    # One-shot absorb of legacy seen file so we don't re-notify old hits
+    if LEGACY_SEEN_FILE.exists():
+        try:
+            with open(LEGACY_SEEN_FILE) as f:
+                legacy = json.load(f)
+            legacy_ids = legacy.get("tweets", legacy.get("seen", []))
+            before = len(seen)
+            for x in legacy_ids:
+                if isinstance(x, dict):
+                    tid = x.get("id")
+                    if tid:
+                        seen.add(str(tid))
+                else:
+                    seen.add(str(x))
+            absorbed = len(seen) - before
+            if absorbed:
+                logger.info(f"merged {absorbed} legacy seen ids")
+        except Exception as e:
+            logger.warning(f"legacy seen merge fail: {e}")
+
+    data["seen"] = _prune_seen(seen)
+    return data
 
 
 def save_state(state):
+    state = dict(state)
+    state["seen"] = _prune_seen(state.get("seen", []))
     with open(STATE_FILE, 'w') as f:
         json.dump(state, f, indent=2)
 
@@ -100,11 +152,11 @@ def send_telegram(text):
     cmd = [
         "curl", "-s", "-X", "POST",
         f"https://api.telegram.org/bot{token}/sendMessage",
-        "-d", f"chat_id={TG_CHAT_ID}",
-        "-d", f"message_thread_id={TG_THREAD_ID}",
-        "-d", f"text={text}",
-        "-d", "parse_mode=HTML",
-        "-d", "disable_web_page_preview=true",
+        "--data-urlencode", f"chat_id={TG_CHAT_ID}",
+        "--data-urlencode", f"message_thread_id={TG_THREAD_ID}",
+        "--data-urlencode", f"text={text}",
+        "--data-urlencode", "parse_mode=HTML",
+        "--data-urlencode", "disable_web_page_preview=true",
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -115,8 +167,8 @@ def send_telegram(text):
 
 async def search_keyword(page, keyword):
     """Search keyword via browser, return list of tweet dicts."""
-    since = (datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)).strftime('%Y-%m-%d')
-    q = f'"{keyword}" since:{since} -filter:replies'
+    # No since: filter — X search is incomplete with since:; age-filter in code instead
+    q = f'"{keyword}" -filter:replies'
     url = 'https://x.com/search?q=' + urllib.parse.quote(q) + '&f=live'
     logger.info(f"  search: {keyword}")
     try:
@@ -255,9 +307,11 @@ async def main():
 
         lines = ["<b>🔍 New Validator Mentions</b>"]
         for t in all_new:
-            text = t['text'][:200]
+            text = html.escape(t['text'][:200])
+            user = html.escape(t['username'] or '?')
+            url = html.escape(t['url'], quote=True)
             lines.append(
-                f"• <a href='{t['url']}'>{t['username']}</a>: {text}"
+                f"• <a href='{url}'>{user}</a>: {text}"
             )
         msg = "\n".join(lines)
         send_telegram(msg)

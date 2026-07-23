@@ -15,7 +15,7 @@ import requests
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import html
 from pathlib import Path
 
@@ -113,7 +113,8 @@ def is_chain_pr(files, repo):
         fname = f["filename"]
         for kw in keywords:
             if kw in fname:
-                if f["status"] == "added" or "new folder" in f.get("patch", "").lower() or f["status"] == "modified":
+                # Only notify on genuinely new chain files, not edits to existing ones
+                if f["status"] == "added" or "new folder" in f.get("patch", "").lower():
                     return True
     return False
 
@@ -132,7 +133,7 @@ def extract_chain_name(files, pr_title):
     return None
 
 def is_silent_hours():
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     wib = now_utc + timedelta(hours=7)
     hour = wib.hour
     return hour >= SILENT_START_HOUR or hour < SILENT_END_HOUR
@@ -140,9 +141,10 @@ def is_silent_hours():
 def main():
     load_tg_token()
     seen = load_seen()
+    # Store as "repo:number" to avoid cross-repo PR number collisions
     seen_prs = set(seen["prs"])
     pending = load_pending()
-    pending_ids = {p["pr_number"] for p in pending}
+    pending_ids = {f"{p['repo']}#{p['pr_number']}" for p in pending}
 
     found = []
     headers = {"Accept": "application/vnd.github.v3+json"}
@@ -162,7 +164,8 @@ def main():
             continue
 
         for pr in prs:
-            if pr["number"] in seen_prs or pr["number"] in pending_ids:
+            pr_key = f"{repo}#{pr['number']}"
+            if pr_key in seen_prs or pr_key in pending_ids:
                 continue
             files = get_pr_files(pr["url"])
             if not files:
@@ -179,40 +182,42 @@ def main():
                 "created_at": pr["created_at"],
                 "user": pr["user"]["login"],
             })
-            seen_prs.add(pr["number"])
+            seen_prs.add(pr_key)
 
     # Gabungkan pending + found baru
     all_to_notify = pending + found
 
-    # Update seen (termasuk yang sudah di pending sebelumnya, agar tidak muncul lagi)
-    save_seen({"prs": list(seen_prs)})
-
     if not all_to_notify:
+        # Still persist seen so we don't re-scan already-seen PRs
+        save_seen({"prs": list(seen_prs)})
         print("[⏳] Tidak ada PR chain baru.", file=sys.stderr)
         return
 
     # Jika jam sepi, simpan ke pending dan keluar (tidak kirim notif)
     if is_silent_hours():
-        # Simpan semua (pending lama + baru) ke pending
+        # Save pending FIRST, then seen — crash between them keeps PRs in pending
         save_pending(all_to_notify)
-        print(f"[] Jam sepi ({SILENT_START_HOUR}-{SILENT_END_HOUR} WIB). {len(all_to_notify)} PR ditahan.", file=sys.stderr)
+        save_seen({"prs": list(seen_prs)})
+        print(f"[🌙] Jam sepi ({SILENT_START_HOUR}-{SILENT_END_HOUR} WIB). {len(all_to_notify)} PR ditahan.", file=sys.stderr)
         return
 
     # Jam aktif: kirim semua dan kosongkan pending
-    msg_lines = [f"<b> GitHub Chain Finder</b>", f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} — Found {len(all_to_notify)} new PRs:"]
+    msg_lines = [f"<b>🔗 GitHub Chain Finder</b>", f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} — Found {len(all_to_notify)} new PRs:"]
     for item in all_to_notify:
-        msg_lines.append(f"\n• <a href='{item['url']}'>{html.escape(item['repo'])} #{item['pr_number']}</a>")
+        msg_lines.append(f"\n• <a href='{html.escape(item['url'], quote=True)}'>{html.escape(item['repo'])} #{item['pr_number']}</a>")
         msg_lines.append(f"   {html.escape(item['title'])}")
         msg_lines.append(f"   Chain: {html.escape(item['chain_name'])}")
         msg_lines.append(f"   Oleh: {html.escape(item['user'])}")
     if send_telegram("\n".join(msg_lines)):
         # Hapus pending setelah berhasil dikirim
         save_pending([])
+        save_seen({"prs": list(seen_prs)})
         print("✅ Notifikasi terkirim, pending cleared.", file=sys.stderr)
     else:
         print("❌ Gagal kirim notifikasi, pending tetap disimpan.", file=sys.stderr)
         # Jika gagal, tetap simpan pending agar dicoba lagi
         save_pending(all_to_notify)
+        save_seen({"prs": list(seen_prs)})
 
 if __name__ == "__main__":
     main()

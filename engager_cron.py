@@ -33,6 +33,7 @@ import json
 import os
 import re
 import fcntl
+import html
 import subprocess
 import tempfile
 import urllib.parse
@@ -123,11 +124,11 @@ def _prune_state(data):
     claim_ttl = now - datetime.timedelta(hours=2)
     data['processed'] = [
         tid for tid in data.get('processed', [])
-        if snowflake_to_dt(tid) is None or snowflake_to_dt(tid) >= cutoff
+        if (dt := snowflake_to_dt(tid)) is None or dt >= cutoff
     ]
     data['skip_reply'] = [
         tid for tid in data.get('skip_reply', [])
-        if snowflake_to_dt(tid) is None or snowflake_to_dt(tid) >= cutoff
+        if (dt := snowflake_to_dt(tid)) is None or dt >= cutoff
     ]
     fresh_claims = {}
     for tid, meta in data['claimed'].items():
@@ -181,11 +182,11 @@ def load_state():
             logger.warning(f"legacy state merge fail {path}: {e}")
     if absorbed:
         logger.info(f"merged {absorbed} legacy ids into engager state")
-    data['processed'] = list(processed)
-    data['skip_reply'] = list(skip)
-    data = _prune_state(data)
-    # Persist merged state so next load is cheap
-    save_state(data)
+        data['processed'] = list(processed)
+        data['skip_reply'] = list(skip)
+        data = _prune_state(data)
+        # Only persist when we actually absorbed something
+        save_state(data)
     return data
 
 
@@ -269,10 +270,11 @@ def send_telegram(message):
         cmd = [
             "curl", "-s", "-X", "POST",
             f"https://api.telegram.org/bot{token}/sendMessage",
-            "-d", f"chat_id={TELEGRAM_CHAT_ID}",
-            "-d", f"message_thread_id={TELEGRAM_THREAD}",
-            "-d", f"text={message}",
-            "-d", "parse_mode=Markdown",
+            "--data-urlencode", f"chat_id={TELEGRAM_CHAT_ID}",
+            "--data-urlencode", f"message_thread_id={TELEGRAM_THREAD}",
+            "--data-urlencode", f"text={message}",
+            "--data-urlencode", "parse_mode=HTML",
+            "--data-urlencode", "disable_web_page_preview=true",
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
         return r.returncode == 0
@@ -521,12 +523,16 @@ async def _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply=None, cl
     return found
 
 
-async def discover_account(page, acc, cutoff, processed_ids, claimed_ids=None):
+async def discover_account(page, acc, cutoff, processed_ids, claimed_ids=None, skip_reply=None):
     found, seen = [], set()
-    state = load_state()
-    skip_reply = set(state.get('skip_reply', []))
-    if claimed_ids is None:
-        claimed_ids = set(state.get('claimed', {}).keys())
+    if skip_reply is None:
+        # Fallback only — prefer caller-provided set to avoid per-account load_state()
+        state = load_state()
+        skip_reply = set(state.get('skip_reply', []))
+        if claimed_ids is None:
+            claimed_ids = set(state.get('claimed', {}).keys())
+    elif claimed_ids is None:
+        claimed_ids = set()
 
     # METHOD 1: Profile page
     profile_url = f'https://x.com/{acc}'
@@ -936,10 +942,13 @@ async def main():
         logger.info(f"cutoff={cutoff.isoformat()}")
 
         pending = []
+        skip_reply = set(str(x) for x in state.get('skip_reply', []))
         for acc in ACCOUNTS:
             try:
                 pending.extend(
-                    await discover_account(page, acc, cutoff, processed_ids, claimed_ids)
+                    await discover_account(
+                        page, acc, cutoff, processed_ids, claimed_ids, skip_reply
+                    )
                 )
             except Exception as e:
                 logger.error(f"discover @{acc}: {e}")
@@ -990,7 +999,7 @@ async def main():
                 logger.error(f"process {tid}: {e}")
 
         if done:
-            lines = [f"*Engage batch* · {len(done)} tweet"]
+            lines = [f"<b>Engage batch</b> · {len(done)} tweet"]
             for t in done:
                 flags = []
                 if t.get('liked'):
@@ -1000,10 +1009,12 @@ async def main():
                 if t.get('retweeted'):
                     flags.append('🔁')
                 qt = t.get('quote_text', '')
-                extra = f" \"{qt[:80]}\"" if qt else ""
+                extra = f" \"{html.escape(qt[:80])}\"" if qt else ""
+                acc = html.escape(str(t.get('account', '?')))
+                tid = html.escape(str(t['id']))
                 lines.append(
-                    f"- @{t.get('account','?')} "
-                    f"[{t['id']}](https://x.com/{t.get('account')}/status/{t['id']}) "
+                    f"- @{acc} "
+                    f"<a href=\"https://x.com/{t.get('account')}/status/{t['id']}\">{tid}</a> "
                     f"{''.join(flags)}{extra}"
                 )
             send_telegram('\n'.join(lines))

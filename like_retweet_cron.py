@@ -41,13 +41,30 @@ def is_active_hours():
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"processed": []}
+        return {"processed": [], "skip_reply": []}
     with open(STATE_FILE) as f:
         data = json.load(f)
     if isinstance(data, list):
-        state = {"processed": [t.get('id') for t in data if t.get('id')]}
+        state = {
+            "processed": [t.get('id') for t in data if t.get('id')],
+            "skip_reply": [],
+        }
         save_state(state)
         return state
+    # backfill skip_reply if missing
+    if 'skip_reply' not in data:
+        data['skip_reply'] = []
+    # auto-clean entries older than MAX_DAYS so state never bloat
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - datetime.timedelta(days=MAX_DAYS)
+    data['processed'] = [
+        tid for tid in data.get('processed', [])
+        if snowflake_to_dt(tid) is None or snowflake_to_dt(tid) >= cutoff
+    ]
+    data['skip_reply'] = [
+        tid for tid in data.get('skip_reply', [])
+        if snowflake_to_dt(tid) is None or snowflake_to_dt(tid) >= cutoff
+    ]
     return data
 
 
@@ -105,6 +122,16 @@ def load_cookies():
     return cookies
 
 
+def snowflake_to_dt(tid):
+    """Extract datetime from Twitter snowflake ID for state cleanup."""
+    try:
+        tid_int = int(tid)
+        timestamp_ms = (tid_int >> 22) + 1288834974657
+        return datetime.datetime.fromtimestamp(timestamp_ms / 1000, tz=datetime.timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
 # JS snippet: parse one article (single arg bag)
 _ARTICLE_JS = '''(el, args) => {
   const acc = (args.acc || '').toLowerCase();
@@ -126,11 +153,36 @@ _ARTICLE_JS = '''(el, args) => {
   const links = [...el.querySelectorAll('a[href*="/status/"]')]
     .map(a => (a.getAttribute('href') || '').split('?')[0]);
   let permalink = null, tid = null;
+  // Pick the link that is likely the tweet's own permalink:
+  // - prefer link that has a timestamp text (contains · or AM/PM)
+  // - or prefer link whose path matches /{acc}/status/{id} where acc matches target
   for (const href of links) {
     const m = href.match(/^\\/([^\\/]+)\\/status\\/(\\d+)$/);
     if (!m) continue;
-    if (m[1].toLowerCase() === authorL || m[1].toLowerCase() === acc) {
-      permalink = href; tid = m[2]; break;
+    // If this link's author is the target account, consider it
+    if (m[1].toLowerCase() === acc) {
+      // Check if this link's text contains a timestamp marker
+      const anchor = el.querySelector(`a[href="${href}"]`);
+      if (anchor) {
+        const txt = anchor.innerText || '';
+        // If it has · or AM/PM/UTC, it's likely the main tweet timestamp
+        if (/[\u00b7]|AM|PM|UTC/.test(txt)) {
+          permalink = href; tid = m[2]; break;
+        }
+      }
+      // If no timestamp marker found, but it's the only candidate, use it
+      if (!permalink) {
+        permalink = href; tid = m[2];
+      }
+    }
+  }
+  // If still no match, fallback to the first link that matches authorL
+  if (!permalink) {
+    for (const href of links) {
+      const m = href.match(/^\\/([^\\/]+)\\/status\\/(\\d+)$/);
+      if (m && m[1].toLowerCase() === authorL) {
+        permalink = href; tid = m[2]; break;
+      }
     }
   }
 
@@ -170,35 +222,90 @@ async def parse_article(locator, acc):
     return await locator.evaluate(_ARTICLE_JS, {"acc": acc})
 
 
-async def _scan_page(page, acc, cutoff, processed_ids, seen):
+async def _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply=None):
     """Scan current page for target account tweets. Returns list of eligible."""
+    if skip_reply is None:
+        skip_reply = set()
     found = []
     n = await page.locator('article').count()
+    logger.info(f"    scanning {n} articles for @{acc}")
     for i in range(n):
         art = page.locator('article').nth(i)
+        d = {}
         try:
             d = await parse_article(art, acc)
         except Exception:
-            continue
+            pass
+        # Jika JS gagal mendeteksi target, coba ekstrak manual
         if not d.get('isTargetAuthor'):
+            try:
+                # Ambil author dari User-Name
+                user_name = art.locator('[data-testid="User-Name"]')
+                if await user_name.count():
+                    author_links = await user_name.locator('a[href^="/"]').all()
+                    if author_links:
+                        # Ambil link terakhir (handle)
+                        last_href = await author_links[-1].get_attribute('href')
+                        if last_href:
+                            author_handle = last_href.lstrip('/').split('?')[0]
+                            if author_handle.lower() == acc.lower():
+                                # Cari status link
+                                status_links = await art.locator('a[href*="/status/"]').all()
+                                for link in status_links:
+                                    href = await link.get_attribute('href')
+                                    if href and f'/{acc}/status/' in href:
+                                        m = re.search(r'/status/(\d+)', href)
+                                        if m:
+                                            d['tid'] = m.group(1)
+                                            d['permalink'] = href.split('?')[0]
+                                            d['isTargetAuthor'] = True
+                                            # Ambil time
+                                            time_el = art.locator('time')
+                                            if await time_el.count():
+                                                d['dt'] = await time_el.first.get_attribute('datetime')
+                                            # like/rt
+                                            like_btn = art.locator('[data-testid="like"], [data-testid="unlike"]')
+                                            if await like_btn.count():
+                                                d['likeTid'] = await like_btn.first.get_attribute('data-testid')
+                                            rt_btn = art.locator('[data-testid="retweet"], [data-testid="unretweet"]')
+                                            if await rt_btn.count():
+                                                d['rtTid'] = await rt_btn.first.get_attribute('data-testid')
+                                            # body
+                                            tweet_text = art.locator('[data-testid="tweetText"]')
+                                            if await tweet_text.count():
+                                                d['body'] = (await tweet_text.first.inner_text())[:200]
+                                            # social context
+                                            social_ctx = art.locator('[data-testid="socialContext"]')
+                                            if await social_ctx.count():
+                                                d['social'] = await social_ctx.first.inner_text()
+                                            break
+            except Exception as e:
+                logger.debug(f"Manual extraction failed: {e}")
+        if not d.get('isTargetAuthor'):
+            logger.debug(f"    art {i}: skip not target author (author={d.get('author')})")
             continue
         if not d.get('permalink') or not d.get('tid'):
+            logger.debug(f"    art {i}: skip no permalink/tid")
             continue
         tid = d['tid']
-        if tid in seen or tid in processed_ids:
+        if tid in seen or tid in processed_ids or tid in skip_reply:
+            logger.debug(f"    art {i}: skip known {tid}")
             continue
         seen.add(tid)
         if d.get('isReplying'):
             logger.info(f"  skip reply {tid}")
             continue
         if d.get('isRepost'):
+            logger.debug(f"    art {i}: skip repost {tid}")
             continue
         if not d['permalink'].lower().startswith(f'/{acc.lower()}/status/'):
+            logger.debug(f"    art {i}: skip permalink mismatch {d.get('permalink')}")
             continue
         if d['dt']:
             try:
                 dt = datetime.datetime.fromisoformat(d['dt'].replace('Z', '+00:00'))
                 if dt < cutoff:
+                    logger.debug(f"    art {i}: skip old {tid} ({d['dt']})")
                     continue
             except Exception:
                 pass
@@ -217,33 +324,68 @@ async def discover_account(page, acc, cutoff, processed_ids):
     """Discover eligible tweets via profile page first, then search fallback.
     Profile page is more reliable than X search which returns inconsistent results."""
     found, seen = [], set()
+    # load skip_reply list
+    state = load_state()
+    skip_reply = set(state.get('skip_reply', []))
 
     # METHOD 1: Profile page (most reliable for account's own tweets)
-    since = cutoff.strftime('%Y-%m-%d')
     profile_url = f'https://x.com/{acc}'
     logger.info(f"  profile: @{acc}")
     await page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
-    await asyncio.sleep(3)
-    # scroll aggressively to load more tweets
-    for _ in range(8):
+    try:
+        await page.wait_for_selector('article', timeout=10000)
+    except Exception:
+        pass
+    await asyncio.sleep(1.5)
+    
+    # Scan before scrolling — catches newest tweets at top
+    no_scroll_found = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply)
+    logger.info(f"  profile (no scroll) @{acc}: {len(no_scroll_found)} eligible")
+    found.extend(no_scroll_found)
+    seen.update({t['id'] for t in no_scroll_found})
+    
+    # scroll aggressively to load more tweets (older ones)
+    for _ in range(15):
         await page.mouse.wheel(0, 1200)
         await asyncio.sleep(0.7)
-    profile_found = await _scan_page(page, acc, cutoff, processed_ids, seen)
-    logger.info(f"  profile @{acc}: {len(profile_found)} eligible")
-    found.extend(profile_found)
+    scroll_found = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply)
+    logger.info(f"  profile (after scroll) @{acc}: {len(scroll_found)} eligible")
+    # deduplicate
+    existing_ids = {t['id'] for t in found}
+    for t in scroll_found:
+        if t['id'] not in existing_ids:
+            found.append(t)
 
-    # METHOD 2: Search fallback (catches anything profile might miss)
-    q = f'from:{acc} since:{since} -filter:replies'
-    search_url = 'https://x.com/search?q=' + urllib.parse.quote(q) + '&f=live'
-    logger.info(f"  search: {q}")
+    # METHOD 2: Search fallback (catches tweets not visible on profile page)
+    # NOTE: no since, no -filter:replies — X search filters are too aggressive.
+    # We handle reply filtering in _scan_page already.
+    search_url = f'https://x.com/search?q=from%3A{acc}&src=typed_query&f=live'
+    logger.info(f"  search: {acc}")
     await page.goto(search_url, wait_until='domcontentloaded', timeout=60000)
-    await asyncio.sleep(3.5)
-    for _ in range(6):
-        await page.mouse.wheel(0, 1200)
-        await asyncio.sleep(0.7)
-    search_found = await _scan_page(page, acc, cutoff, processed_ids, seen)
-    logger.info(f"  search @{acc}: {len(search_found)} eligible")
-    found.extend(search_found)
+    try:
+        await page.wait_for_selector('article', timeout=10000)
+    except Exception:
+        pass
+    await asyncio.sleep(1.5)
+    
+    # Scan before scrolling — catches newest tweets at top
+    search_no_scroll = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply)
+    logger.info(f"  search (no scroll) @{acc}: {len(search_no_scroll)} eligible")
+    existing_ids = {t['id'] for t in found}
+    for t in search_no_scroll:
+        if t['id'] not in existing_ids:
+            found.append(t)
+    seen.update({t['id'] for t in search_no_scroll})
+    
+    for _ in range(10):
+        await page.mouse.wheel(0, 1000)
+        await asyncio.sleep(0.5)
+    search_scroll = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply)
+    logger.info(f"  search (after scroll) @{acc}: {len(search_scroll)} eligible")
+    existing_ids = {t['id'] for t in found}
+    for t in search_scroll:
+        if t['id'] not in existing_ids:
+            found.append(t)
 
     logger.info(f"  @{acc}: total eligible={len(found)}")
     return found
@@ -279,7 +421,12 @@ async def process_tweet(page, tweet):
     tweet['permalink'] = f"/{acc}/status/{tid}"
     logger.info(f"  process: {url}")
     await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-    await asyncio.sleep(random.uniform(2.0, 3.0))
+    # wait for article to render (X can be slow to hydrate)
+    try:
+        await page.wait_for_selector('article', timeout=15000)
+    except Exception:
+        pass
+    await asyncio.sleep(random.uniform(1.0, 1.5))
 
     arts = page.locator('article')
     n = await arts.count()
@@ -393,10 +540,29 @@ async def main():
 
     await page.goto('https://x.com/home', wait_until='domcontentloaded', timeout=60000)
     await asyncio.sleep(3)
+
+    # Accept cookies if popup appears
+    try:
+        accept_btn = page.locator('button:has-text("Accept all cookies")')
+        if await accept_btn.count():
+            await accept_btn.first.click()
+            logger.info("Accepted cookies")
+            await asyncio.sleep(1)
+    except Exception:
+        pass
+
     if '/login' in page.url or '/i/flow/login' in page.url:
         logger.error(f"Login FAIL url={page.url}")
         await browser.close(); await p.stop(); return
-    logger.info("Login OK")
+    # verify articles render (detect stale cookie / cookie wall)
+    art_count = await page.locator('article').count()
+    if art_count == 0:
+        body_preview = (await page.inner_text('body'))[:300]
+        if 'cookie' in body_preview.lower() or 'kuki' in body_preview.lower():
+            logger.warning("Cookie wall / stale cookies detected on home page")
+        else:
+            logger.warning("No articles on home — possible login issue")
+    logger.info(f"Login OK (articles={art_count})")
 
     now = datetime.datetime.now(datetime.timezone.utc)
     cutoff = now - datetime.timedelta(days=MAX_DAYS)
@@ -428,8 +594,9 @@ async def main():
             # only mark processed if we actually acted or confirmed skip permanently
             if tweet.get('skipped') == 'reply_or_wrong_root':
                 # permanent skip — it's a reply, don't retry
-                processed_ids.add(tweet['id'])
-                state['processed'] = list(processed_ids)
+                skip_reply_set = set(state.get('skip_reply', []))
+                skip_reply_set.add(tweet['id'])
+                state['skip_reply'] = list(skip_reply_set)
                 save_state(state)
                 logger.info(f"  marked reply skipped {tweet['id']}")
                 continue
