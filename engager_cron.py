@@ -68,6 +68,99 @@ logger = logging.getLogger(__name__)
 # Single-process lock handle (held for whole run)
 _lock_fh = None
 
+# Lazy RapidOCR singleton (image → text for quote context)
+_ocr_engine = None
+
+
+def _get_ocr():
+    global _ocr_engine
+    if _ocr_engine is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _ocr_engine = RapidOCR()
+        except Exception as e:
+            logger.warning(f"  OCR unavailable: {e}")
+            _ocr_engine = False  # mark failed so we don't retry every tweet
+    return _ocr_engine if _ocr_engine is not False else None
+
+
+def ocr_image_url(url, timeout=12):
+    """Download image URL and return compact OCR text (or '')."""
+    if not url:
+        return ""
+    ocr = _get_ocr()
+    if ocr is None:
+        return ""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        if not data or len(data) < 200:
+            return ""
+        # Write to temp file — RapidOCR wants a path/ndarray
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as fh:
+            fh.write(data)
+            path = fh.name
+        try:
+            result, _ = ocr(path)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if not result:
+            return ""
+        # result rows: [box, text, conf]
+        texts = [r[1].strip() for r in result if r and r[1] and str(r[1]).strip()]
+        # compact: drop pure noise chars, join
+        joined = " | ".join(texts)
+        return joined[:400]
+    except Exception as e:
+        logger.warning(f"  OCR failed for {url[:80]}: {e}")
+        return ""
+
+
+def fetch_media_urls_vxtwitter(account, tid):
+    """Fallback media URL list via vxtwitter (no browser needed)."""
+    try:
+        url = f"https://api.vxtwitter.com/{account}/status/{tid}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        urls = []
+        for m in data.get("media_extended") or []:
+            u = m.get("url") or m.get("thumbnail_url")
+            if u and "pbs.twimg.com" in u:
+                urls.append(u)
+        for u in data.get("mediaURLs") or []:
+            if u and "pbs.twimg.com" in u and u not in urls:
+                urls.append(u)
+        return urls[:3]
+    except Exception as e:
+        logger.debug(f"  vxtwitter media fail: {e}")
+        return []
+
+
+def _parse_llm_json(raw: str):
+    """Parse 9router response; sometimes returns concatenated JSON objects."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    depth = 0
+    end = 0
+    for i, ch in enumerate(raw):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end:
+        return json.loads(raw[:end])
+    raise ValueError(f"unparseable LLM response: {raw[:160]}")
+
 
 def is_active_hours():
     return True
@@ -311,18 +404,29 @@ def snowflake_to_dt(tid):
         return None
 
 
-def generate_quote_text(tweet_text, account):
-    """Call local 9router LLM to generate a natural quote response."""
+def generate_quote_text(tweet_text, account, media_context=""):
+    """Call local 9router LLM to generate a natural quote response.
+
+    media_context: OCR text from attached images (tiers, charts, etc.) so the
+    quote can react to what the post *shows*, not only the caption.
+    """
     system = (
         "Write short natural X quote tweets. Output only the quote text. "
-        "Stay positive or neutral. Never mention other projects, never hate, never SARA."
+        "Stay positive or neutral. Never mention other projects, never hate, never SARA. "
+        "Use the image text when present — it often has the real offer/details."
     )
+    media_line = ""
+    if media_context:
+        media_line = f"Image text (OCR): \"{media_context[:400]}\"\n"
     prompt = (
         f"Quote-tweet @{account}:\n\n"
-        f"\"{tweet_text[:500]}\"\n\n"
-        f"Write one short quote, max 12 words.\n"
+        f"Tweet text: \"{tweet_text[:500]}\"\n"
+        f"{media_line}\n"
+        f"Write one short quote, max 12 words, that fits THIS post.\n"
         f"Rules:\n"
-        f"- React to a specific detail (token, number, feature) — don't restate the whole tweet.\n"
+        f"- React to a specific detail from the tweet OR image "
+        f"(token, %, tier, stage, range, feature) — don't restate the whole tweet.\n"
+        f"- If image shows tiers/stages/bonus chart, react to that (current stage, top tier, etc.).\n"
         f"- One clean sentence or fragment. Natural, not slangy, not corporate.\n"
         f"- Stay on THIS project only. Never name, compare, or dunk on other chains/tokens/projects.\n"
         f"- No hate, no insults, no religion/ethnicity/politics (SARA), no drama.\n"
@@ -348,7 +452,7 @@ def generate_quote_text(tweet_text, account):
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode())
+            result = _parse_llm_json(resp.read().decode())
             text = result["choices"][0]["message"]["content"].strip()
             # Clean up: remove surrounding quotes if LLM added them
             if text.startswith('"') and text.endswith('"'):
@@ -846,7 +950,7 @@ async def process_quote(page, tweet):
     # 1) Always like
     await do_like(target, first, tweet)
 
-    # 2) Prefer LLM quote
+    # 2) Prefer LLM quote — include image OCR so quote fits the full post
     tweet_text = tweet.get('text', '')
     if not tweet_text or len(tweet_text) < 10:
         try:
@@ -856,9 +960,40 @@ async def process_quote(page, tweet):
         except Exception:
             pass
 
+    # Media context: OCR attached images (charts, tiers, bonus tables, etc.)
+    media_context = ""
+    media_urls = []
+    try:
+        imgs = target.locator('img[src*="pbs.twimg.com/media"]')
+        n_img = await imgs.count()
+        for i in range(min(n_img, 2)):
+            src = await imgs.nth(i).get_attribute("src")
+            if src and src not in media_urls:
+                # Prefer larger size for OCR
+                src = re.sub(r"[?&]name=\w+", "", src)
+                if "name=" not in src:
+                    src = src + ("&" if "?" in src else "?") + "name=large"
+                media_urls.append(src)
+    except Exception as e:
+        logger.debug(f"  DOM media extract fail: {e}")
+    if not media_urls:
+        media_urls = await asyncio.to_thread(fetch_media_urls_vxtwitter, acc, tid)
+    if media_urls:
+        logger.info(f"  media for OCR: {len(media_urls)} image(s)")
+        parts = []
+        for u in media_urls:
+            txt = await asyncio.to_thread(ocr_image_url, u)
+            if txt:
+                parts.append(txt)
+        media_context = " || ".join(parts)
+        if media_context:
+            logger.info(f"  OCR: {media_context[:160]}")
+
     quote_text = None
-    if tweet_text:
-        quote_text = await asyncio.to_thread(generate_quote_text, tweet_text, acc)
+    if tweet_text or media_context:
+        quote_text = await asyncio.to_thread(
+            generate_quote_text, tweet_text or "", acc, media_context
+        )
 
     if quote_text:
         logger.info(f"  quote text: \"{quote_text}\"")
