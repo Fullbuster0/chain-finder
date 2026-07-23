@@ -9,6 +9,13 @@ Engagement priority per tweet:
   3. Fallback plain retweet if LLM fails / quote UI fails
   (Never posts template/canned quote text.)
 
+Anti double-quote (layers):
+  - flock on quote_cron.lock → only one process at a time
+  - quote_queue.json: processed[] + claimed{} (claim-before-act, TTL 2h)
+  - atomic save (temp + os.replace)
+  - UI guard: data-testid=unretweet → already engaged, skip re-quote
+  - discovery skips processed + claimed + skip_reply
+
 Flow:
 - Discover via profile + search (same dual-scan as like_retweet)
 - Only original root tweets by target account (never replies / pure reposts)
@@ -22,7 +29,9 @@ import random
 import json
 import os
 import re
+import fcntl
 import subprocess
+import tempfile
 import urllib.parse
 import urllib.request
 from playwright.async_api import async_playwright
@@ -32,6 +41,7 @@ COOKIE_FILE = "/home/hermes/chain-finder/x_cookies.txt"
 ACCOUNTS = ['_atomone', 'Hippo_Protocol', 'ShentuChain', 'phoenix_dir', 'ZetaChain', '_gnoland']
 MAX_DAYS = 7
 STATE_FILE = "/home/hermes/chain-finder/quote_queue.json"
+LOCK_FILE = "/home/hermes/chain-finder/quote_cron.lock"
 BRIDGE_CONFIG = "/home/hermes/.hermes/bridge_config.json"
 TELEGRAM_CHAT_ID = "-1003641668106"
 TELEGRAM_THREAD = "10"
@@ -45,27 +55,63 @@ LLM_MODEL = "Knight"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Single-process lock handle (held for whole run)
+_lock_fh = None
+
 
 def is_active_hours():
     return True
 
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {"processed": [], "skip_reply": []}
-    with open(STATE_FILE) as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        state = {
-            "processed": [t.get('id') for t in data if t.get('id')],
-            "skip_reply": [],
-        }
-        save_state(state)
-        return state
+def acquire_run_lock():
+    """Exclusive flock so two quote_cron processes never act on the same post."""
+    global _lock_fh
+    if _lock_fh is not None:
+        return True  # already holding in this process
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    fh = open(LOCK_FILE, 'a+')
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        logger.error("Another quote_cron is running (lock held). Exit.")
+        return False
+    fh.seek(0)
+    fh.truncate()
+    fh.write(f"pid={os.getpid()} started={datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
+    fh.flush()
+    _lock_fh = fh
+    return True
+
+
+def release_run_lock():
+    global _lock_fh
+    if _lock_fh is None:
+        return
+    try:
+        fcntl.flock(_lock_fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        _lock_fh.close()
+    except Exception:
+        pass
+    _lock_fh = None
+
+
+def _empty_state():
+    return {"processed": [], "skip_reply": [], "claimed": {}}
+
+
+def _prune_state(data):
+    """Drop ids older than MAX_DAYS; drop stale claims (>2h)."""
     if 'skip_reply' not in data:
         data['skip_reply'] = []
+    if 'claimed' not in data or not isinstance(data.get('claimed'), dict):
+        data['claimed'] = {}
     now = datetime.datetime.now(datetime.timezone.utc)
     cutoff = now - datetime.timedelta(days=MAX_DAYS)
+    claim_ttl = now - datetime.timedelta(hours=2)
     data['processed'] = [
         tid for tid in data.get('processed', [])
         if snowflake_to_dt(tid) is None or snowflake_to_dt(tid) >= cutoff
@@ -74,12 +120,95 @@ def load_state():
         tid for tid in data.get('skip_reply', [])
         if snowflake_to_dt(tid) is None or snowflake_to_dt(tid) >= cutoff
     ]
+    fresh_claims = {}
+    for tid, meta in data['claimed'].items():
+        try:
+            ts = datetime.datetime.fromisoformat(str(meta.get('at', '')).replace('Z', '+00:00'))
+            if ts >= claim_ttl:
+                fresh_claims[str(tid)] = meta
+        except Exception:
+            # unparseable claim → drop (don't block forever)
+            pass
+    data['claimed'] = fresh_claims
     return data
 
 
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return _empty_state()
+    with open(STATE_FILE) as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        state = {
+            "processed": [t.get('id') for t in data if t.get('id')],
+            "skip_reply": [],
+            "claimed": {},
+        }
+        save_state(state)
+        return state
+    return _prune_state(data)
+
+
 def save_state(state):
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f, indent=2)
+    """Atomic write: temp file + os.replace so crash mid-write can't corrupt JSON."""
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    dirn = os.path.dirname(STATE_FILE) or '.'
+    fd, tmp = tempfile.mkstemp(prefix='.quote_queue.', suffix='.tmp', dir=dirn)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def claim_tweet(state, tid, processed_ids):
+    """
+    Claim-before-act: mark tid in state BEFORE posting so a crash mid-quote
+    still blocks a second quote of the same post.
+    Returns False if already processed/claimed.
+    """
+    tid = str(tid)
+    claimed = state.setdefault('claimed', {})
+    if tid in processed_ids or tid in claimed:
+        logger.info(f"  claim rejected (already handled): {tid}")
+        return False
+    claimed[tid] = {
+        'at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'pid': os.getpid(),
+    }
+    state['claimed'] = claimed
+    save_state(state)
+    return True
+
+
+def finalize_tweet(state, processed_ids, tid, ok=True):
+    """Move claim → processed (ok) or drop claim (failed, allow retry)."""
+    tid = str(tid)
+    claimed = state.setdefault('claimed', {})
+    claimed.pop(tid, None)
+    state['claimed'] = claimed
+    if ok:
+        processed_ids.add(tid)
+        state['processed'] = list(processed_ids)
+    save_state(state)
+
+
+def mark_skip_reply(state, tid):
+    tid = str(tid)
+    claimed = state.setdefault('claimed', {})
+    claimed.pop(tid, None)
+    state['claimed'] = claimed
+    skip = set(state.get('skip_reply', []))
+    skip.add(tid)
+    state['skip_reply'] = list(skip)
+    save_state(state)
 
 
 def load_tg_token():
@@ -266,9 +395,11 @@ async def parse_article(locator, acc):
     return await locator.evaluate(_ARTICLE_JS, {"acc": acc})
 
 
-async def _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply=None):
+async def _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply=None, claimed_ids=None):
     if skip_reply is None:
         skip_reply = set()
+    if claimed_ids is None:
+        claimed_ids = set()
     found = []
     n = await page.locator('article').count()
     logger.info(f"    scanning {n} articles for @{acc}")
@@ -324,6 +455,9 @@ async def _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply=None):
         if tid in seen or tid in processed_ids or tid in skip_reply:
             continue
         seen.add(tid)
+        if tid in claimed_ids:
+            logger.info(f"  skip claimed (in-flight) {tid}")
+            continue
         if d.get('isReplying'):
             logger.info(f"  skip reply {tid}")
             continue
@@ -347,10 +481,12 @@ async def _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply=None):
     return found
 
 
-async def discover_account(page, acc, cutoff, processed_ids):
+async def discover_account(page, acc, cutoff, processed_ids, claimed_ids=None):
     found, seen = [], set()
     state = load_state()
     skip_reply = set(state.get('skip_reply', []))
+    if claimed_ids is None:
+        claimed_ids = set(state.get('claimed', {}).keys())
 
     # METHOD 1: Profile page
     profile_url = f'https://x.com/{acc}'
@@ -362,7 +498,7 @@ async def discover_account(page, acc, cutoff, processed_ids):
         pass
     await asyncio.sleep(1.5)
 
-    no_scroll_found = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply)
+    no_scroll_found = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply, claimed_ids)
     logger.info(f"  profile (no scroll) @{acc}: {len(no_scroll_found)} eligible")
     found.extend(no_scroll_found)
     seen.update({t['id'] for t in no_scroll_found})
@@ -370,7 +506,7 @@ async def discover_account(page, acc, cutoff, processed_ids):
     for _ in range(15):
         await page.mouse.wheel(0, 1200)
         await asyncio.sleep(0.7)
-    scroll_found = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply)
+    scroll_found = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply, claimed_ids)
     logger.info(f"  profile (after scroll) @{acc}: {len(scroll_found)} eligible")
     existing_ids = {t['id'] for t in found}
     for t in scroll_found:
@@ -387,7 +523,7 @@ async def discover_account(page, acc, cutoff, processed_ids):
         pass
     await asyncio.sleep(1.5)
 
-    search_no_scroll = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply)
+    search_no_scroll = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply, claimed_ids)
     logger.info(f"  search (no scroll) @{acc}: {len(search_no_scroll)} eligible")
     existing_ids = {t['id'] for t in found}
     for t in search_no_scroll:
@@ -398,7 +534,7 @@ async def discover_account(page, acc, cutoff, processed_ids):
     for _ in range(10):
         await page.mouse.wheel(0, 1000)
         await asyncio.sleep(0.5)
-    search_scroll = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply)
+    search_scroll = await _scan_page(page, acc, cutoff, processed_ids, seen, skip_reply, claimed_ids)
     logger.info(f"  search (after scroll) @{acc}: {len(search_scroll)} eligible")
     existing_ids = {t['id'] for t in found}
     for t in search_scroll:
@@ -608,6 +744,7 @@ async def process_quote(page, tweet):
       2. Prefer LLM quote (natural, contextual)
       3. Fallback plain retweet if LLM fails / quote UI fails
     Never posts template/canned quote text.
+    UI guard: if button already shows unretweet, skip quote/RT (already engaged).
     """
     tid = str(tweet['id'])
     acc = tweet.get('account', '')
@@ -646,6 +783,14 @@ async def process_quote(page, tweet):
 
     target = arts.nth(0)
     logger.info(f"  target article[0] @{first.get('author')} ok")
+
+    # UI-level double-quote guard: already reposted/quoted from this account
+    if first.get('rtTid') == 'unretweet':
+        logger.info("  already unretweet state — treat as already engaged, skip re-quote")
+        tweet['retweeted'] = True
+        tweet['skipped'] = 'already_engaged'
+        await do_like(target, first, tweet)
+        return tweet
 
     # 1) Always like
     await do_like(target, first, tweet)
@@ -686,129 +831,156 @@ async def main():
         logger.info("Outside active hours. Skip.")
         return
 
-    logger.info("=== quote_cron start ===")
-    state = load_state()
-    processed_ids = set(state.get("processed", []))
-    logger.info(f"processed_state={len(processed_ids)}")
+    if not acquire_run_lock():
+        return
 
-    p = await async_playwright().start()
-    browser = await p.chromium.launch(
-        headless=True,
-        args=['--no-sandbox', '--disable-dev-shm-usage',
-              '--disable-blink-features=AutomationControlled'],
-    )
-    ctx = await browser.new_context(
-        viewport={'width': 1280, 'height': 900},
-        user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/125.0.0.0 Safari/537.36'),
-        locale='en-US',
-    )
-    page = await ctx.new_page()
-    await Stealth().apply_stealth_async(page)
-
-    cookies = load_cookies()
-    if not cookies:
-        logger.error("No cookies")
-        await browser.close(); await p.stop(); return
-    await ctx.add_cookies(cookies)
-    logger.info(f"cookies={len(cookies)}")
-
-    await page.goto('https://x.com/home', wait_until='domcontentloaded', timeout=60000)
-    await asyncio.sleep(3)
-
-    # Accept cookies if popup appears
+    browser = None
+    p = None
     try:
-        accept_btn = page.locator('button:has-text("Accept all cookies")')
-        if await accept_btn.count():
-            await accept_btn.first.click()
-            logger.info("Accepted cookies")
-            await asyncio.sleep(1)
-    except Exception:
-        pass
+        logger.info("=== quote_cron start ===")
+        state = load_state()
+        processed_ids = set(str(x) for x in state.get("processed", []))
+        claimed_ids = set(str(x) for x in state.get("claimed", {}).keys())
+        logger.info(f"processed_state={len(processed_ids)} claimed={len(claimed_ids)}")
 
-    if '/login' in page.url or '/i/flow/login' in page.url:
-        logger.error(f"Login FAIL url={page.url}")
-        await browser.close(); await p.stop(); return
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-dev-shm-usage',
+                  '--disable-blink-features=AutomationControlled'],
+        )
+        ctx = await browser.new_context(
+            viewport={'width': 1280, 'height': 900},
+            user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/125.0.0.0 Safari/537.36'),
+            locale='en-US',
+        )
+        page = await ctx.new_page()
+        await Stealth().apply_stealth_async(page)
 
-    art_count = await page.locator('article').count()
-    if art_count == 0:
-        body_preview = (await page.inner_text('body'))[:300]
-        if 'cookie' in body_preview.lower() or 'kuki' in body_preview.lower():
-            logger.warning("Cookie wall / stale cookies detected on home page")
-        else:
-            logger.warning("No articles on home — possible login issue")
-    logger.info(f"Login OK (articles={art_count})")
+        cookies = load_cookies()
+        if not cookies:
+            logger.error("No cookies")
+            return
+        await ctx.add_cookies(cookies)
+        logger.info(f"cookies={len(cookies)}")
 
-    now = datetime.datetime.now(datetime.timezone.utc)
-    cutoff = now - datetime.timedelta(days=MAX_DAYS)
-    logger.info(f"cutoff={cutoff.isoformat()}")
+        await page.goto('https://x.com/home', wait_until='domcontentloaded', timeout=60000)
+        await asyncio.sleep(3)
 
-    pending = []
-    for acc in ACCOUNTS:
         try:
-            pending.extend(await discover_account(page, acc, cutoff, processed_ids))
-        except Exception as e:
-            logger.error(f"discover @{acc}: {e}")
+            accept_btn = page.locator('button:has-text("Accept all cookies")')
+            if await accept_btn.count():
+                await accept_btn.first.click()
+                logger.info("Accepted cookies")
+                await asyncio.sleep(1)
+        except Exception:
+            pass
 
-    uniq = {t['id']: t for t in pending}
-    pending = list(uniq.values())
-    logger.info(f"total eligible={len(pending)}")
-    if not pending:
-        logger.info("no eligible tweets, exiting")
-        await browser.close(); await p.stop(); return
+        if '/login' in page.url or '/i/flow/login' in page.url:
+            logger.error(f"Login FAIL url={page.url}")
+            return
 
-    # Shuffle-and-pick pattern (pre-validate, don't waste slots)
-    random.shuffle(pending)
-    n = random.randint(MIN_ACTIONS, MAX_ACTIONS)
-    logger.info(f"target={n} quotes from {len(pending)} eligible")
-
-    done = []
-    for tweet in pending:
-        if len(done) >= n:
-            break
-        try:
-            await process_quote(page, tweet)
-            if tweet.get('skipped') == 'reply_or_wrong_root':
-                skip_reply_set = set(state.get('skip_reply', []))
-                skip_reply_set.add(tweet['id'])
-                state['skip_reply'] = list(skip_reply_set)
-                save_state(state)
-                logger.info(f"  marked reply skipped {tweet['id']}")
-                continue
-            engaged = tweet.get('quoted') or tweet.get('retweeted')
-            if engaged:
-                processed_ids.add(tweet['id'])
-                state['processed'] = list(processed_ids)
-                save_state(state)
-                done.append(tweet)
+        art_count = await page.locator('article').count()
+        if art_count == 0:
+            body_preview = (await page.inner_text('body'))[:300]
+            if 'cookie' in body_preview.lower() or 'kuki' in body_preview.lower():
+                logger.warning("Cookie wall / stale cookies detected on home page")
             else:
-                # Nothing engaged (like may have worked but no quote/RT) — allow retry
-                logger.warning(f"  no quote/RT for {tweet['id']}, not marking processed")
-        except Exception as e:
-            logger.error(f"process {tweet['id']}: {e}")
+                logger.warning("No articles on home — possible login issue")
+        logger.info(f"Login OK (articles={art_count})")
 
-    if done:
-        lines = [f"*Engage batch* · {len(done)} tweet"]
-        for t in done:
-            flags = []
-            if t.get('liked'):
-                flags.append('❤️')
-            if t.get('quoted'):
-                flags.append('💬')
-            if t.get('retweeted'):
-                flags.append('🔁')
-            qt = t.get('quote_text', '')
-            extra = f" \"{qt[:80]}\"" if qt else ""
-            lines.append(
-                f"- @{t.get('account','?')} "
-                f"[{t['id']}](https://x.com/{t.get('account')}/status/{t['id']}) "
-                f"{''.join(flags)}{extra}"
-            )
-        send_telegram('\n'.join(lines))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cutoff = now - datetime.timedelta(days=MAX_DAYS)
+        logger.info(f"cutoff={cutoff.isoformat()}")
 
-    await browser.close(); await p.stop()
-    logger.info("=== done ===")
+        pending = []
+        for acc in ACCOUNTS:
+            try:
+                pending.extend(
+                    await discover_account(page, acc, cutoff, processed_ids, claimed_ids)
+                )
+            except Exception as e:
+                logger.error(f"discover @{acc}: {e}")
+
+        uniq = {t['id']: t for t in pending}
+        pending = list(uniq.values())
+        logger.info(f"total eligible={len(pending)}")
+        if not pending:
+            logger.info("no eligible tweets, exiting")
+            return
+
+        random.shuffle(pending)
+        n = random.randint(MIN_ACTIONS, MAX_ACTIONS)
+        logger.info(f"target={n} quotes from {len(pending)} eligible")
+
+        done = []
+        for tweet in pending:
+            if len(done) >= n:
+                break
+            tid = str(tweet['id'])
+            # Claim-before-act: persist id BEFORE any UI action
+            if not claim_tweet(state, tid, processed_ids):
+                claimed_ids.add(tid)
+                continue
+            claimed_ids.add(tid)
+            try:
+                await process_quote(page, tweet)
+                if tweet.get('skipped') == 'reply_or_wrong_root':
+                    mark_skip_reply(state, tid)
+                    logger.info(f"  marked reply skipped {tid}")
+                    continue
+                if tweet.get('skipped') == 'already_engaged':
+                    # UI says we already RT/quoted — permanently mark processed
+                    finalize_tweet(state, processed_ids, tid, ok=True)
+                    logger.info(f"  already engaged, marked processed {tid}")
+                    continue
+                engaged = tweet.get('quoted') or tweet.get('retweeted')
+                if engaged:
+                    finalize_tweet(state, processed_ids, tid, ok=True)
+                    done.append(tweet)
+                else:
+                    # Release claim so a later run can retry
+                    finalize_tweet(state, processed_ids, tid, ok=False)
+                    claimed_ids.discard(tid)
+                    logger.warning(f"  no quote/RT for {tid}, claim released for retry")
+            except Exception as e:
+                # Keep claim (TTL 2h) so crash mid-post doesn't immediately re-quote
+                logger.error(f"process {tid}: {e}")
+
+        if done:
+            lines = [f"*Engage batch* · {len(done)} tweet"]
+            for t in done:
+                flags = []
+                if t.get('liked'):
+                    flags.append('❤️')
+                if t.get('quoted'):
+                    flags.append('💬')
+                if t.get('retweeted'):
+                    flags.append('🔁')
+                qt = t.get('quote_text', '')
+                extra = f" \"{qt[:80]}\"" if qt else ""
+                lines.append(
+                    f"- @{t.get('account','?')} "
+                    f"[{t['id']}](https://x.com/{t.get('account')}/status/{t['id']}) "
+                    f"{''.join(flags)}{extra}"
+                )
+            send_telegram('\n'.join(lines))
+
+        logger.info("=== done ===")
+    finally:
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if p is not None:
+            try:
+                await p.stop()
+            except Exception:
+                pass
+        release_run_lock()
 
 
 if __name__ == '__main__':
