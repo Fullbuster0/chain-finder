@@ -162,6 +162,14 @@ def send_telegram(text):
     if r.returncode != 0:
         logger.error(f"TG fail: {r.stderr[:200]}")
         return False
+    try:
+        body = json.loads(r.stdout or "{}")
+        if not body.get("ok"):
+            logger.error(f"TG API fail: {body.get('description', body)[:200]}")
+            return False
+    except json.JSONDecodeError:
+        logger.error(f"TG bad response: {(r.stdout or '')[:200]}")
+        return False
     return True
 
 
@@ -272,56 +280,70 @@ async def main():
     if cookies:
         await ctx.add_cookies(cookies)
 
-    # verify login
-    await page.goto('https://x.com/home', wait_until='domcontentloaded', timeout=60000)
-    await asyncio.sleep(2.5)
-    if '/login' in page.url or '/i/flow/login' in page.url:
-        logger.error(f"Login FAIL {page.url}")
-        await browser.close(); await p.stop(); return
-    logger.info("Login OK")
+    try:
+        # verify login
+        await page.goto('https://x.com/home', wait_until='domcontentloaded', timeout=60000)
+        await asyncio.sleep(2.5)
+        if '/login' in page.url or '/i/flow/login' in page.url:
+            logger.error(f"Login FAIL {page.url}")
+            return
+        logger.info("Login OK")
 
-    all_new = []
-    for kw in KEYWORDS:
-        try:
-            tweets = await search_keyword(page, kw)
-        except Exception as e:
-            logger.error(f"search '{kw}': {e}")
-            continue
-
-        for t in tweets:
-            if t['id'] in seen:
+        all_new = []
+        for kw in KEYWORDS:
+            try:
+                tweets = await search_keyword(page, kw)
+            except Exception as e:
+                logger.error(f"search '{kw}': {e}")
                 continue
-            seen.add(t['id'])
-            all_new.append(t)
 
-    save_state({"seen": list(seen)})
-    logger.info(f"new tweets: {len(all_new)}")
+            for t in tweets:
+                if t['id'] in seen:
+                    continue
+                seen.add(t['id'])
+                all_new.append(t)
 
-    if all_new:
-        # deduplicate
-        uniq = {}
-        for t in all_new:
-            if t['id'] not in uniq:
-                uniq[t['id']] = t
-        all_new = list(uniq.values())[:MAX_POSTS]
+        # Only persist seen AFTER successful scan — crash mid-loop won't mark unseen as seen
+        save_state({"seen": list(seen)})
+        logger.info(f"new tweets: {len(all_new)}")
 
-        lines = ["<b>🔍 New Validator Mentions</b>"]
-        for t in all_new:
-            text = html.escape(t['text'][:200])
-            user = html.escape(t['username'] or '?')
-            url = html.escape(t['url'], quote=True)
-            lines.append(
-                f"• <a href='{url}'>{user}</a>: {text}"
-            )
-        msg = "\n".join(lines)
-        send_telegram(msg)
-        logger.info(f"sent {len(all_new)} notifications")
-    else:
-        logger.info("no new tweets")
+        if all_new:
+            # deduplicate
+            uniq = {}
+            for t in all_new:
+                if t['id'] not in uniq:
+                    uniq[t['id']] = t
+            all_new = list(uniq.values())[:MAX_POSTS]
 
-    await browser.close()
-    await p.stop()
-    logger.info("=== done ===")
+            lines = ["<b>🔍 New Validator Mentions</b>"]
+            for t in all_new:
+                text = html.escape(t['text'][:200])
+                user = html.escape(t['username'] or '?')
+                url = html.escape(t['url'], quote=True)
+                lines.append(
+                    f"• <a href='{url}'>{user}</a>: {text}"
+                )
+            msg = "\n".join(lines)
+            if send_telegram(msg):
+                logger.info(f"sent {len(all_new)} notifications")
+            else:
+                # TG failed: drop these ids from seen so next run can retry notify
+                for t in all_new:
+                    seen.discard(t['id'])
+                save_state({"seen": list(seen)})
+                logger.error(f"TG failed — rolled back {len(all_new)} ids from seen")
+        else:
+            logger.info("no new tweets")
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        try:
+            await p.stop()
+        except Exception:
+            pass
+        logger.info("=== done ===")
 
 
 if __name__ == "__main__":

@@ -66,12 +66,20 @@ def send_telegram(text):
     }
     try:
         resp = requests.post(url, data=params, timeout=10)
-        if resp.status_code == 200:
-            print("Telegram notification sent", file=sys.stderr)
-            return True
-        else:
+        if resp.status_code != 200:
             print(f"Telegram failed: {resp.status_code} - {resp.text[:200]}", file=sys.stderr)
             return False
+        # TG can return 200 with ok:false on some edge cases — verify body
+        try:
+            body = resp.json()
+            if not body.get("ok"):
+                print(f"Telegram API fail: {body.get('description', body)}", file=sys.stderr)
+                return False
+        except ValueError:
+            print(f"Telegram bad response: {resp.text[:200]}", file=sys.stderr)
+            return False
+        print("Telegram notification sent", file=sys.stderr)
+        return True
     except Exception as e:
         print(f"Telegram error: {e}", file=sys.stderr)
         return False
@@ -103,7 +111,7 @@ def get_pr_files(pr_url):
         r = requests.get(pr_url + "/files", timeout=10)
         if r.status_code == 200:
             return r.json()
-    except:
+    except Exception:
         pass
     return []
 

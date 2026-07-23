@@ -474,7 +474,19 @@ def send_telegram(message):
             "--data-urlencode", "disable_web_page_preview=true",
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
-        return r.returncode == 0
+        if r.returncode != 0:
+            logger.error(f"Telegram curl fail: {r.stderr[:200]}")
+            return False
+        # curl 0 != API success — TG returns {"ok":false,...} on parse/token errors
+        try:
+            body = json.loads(r.stdout or "{}")
+            if not body.get("ok"):
+                logger.error(f"Telegram API fail: {body.get('description', body)[:200]}")
+                return False
+        except json.JSONDecodeError:
+            logger.error(f"Telegram bad response: {(r.stdout or '')[:200]}")
+            return False
+        return True
     except Exception as e:
         logger.error(f"Telegram error: {e}")
         return False
@@ -521,7 +533,9 @@ def generate_quote_text(tweet_text, account, media_context=""):
     )
     media_line = ""
     if media_context:
-        media_line = f"Image text (OCR): \"{media_context[:400]}\"\n"
+        # Label by source: vision fills "[image shows: ...]", OCR is raw text
+        label = "Image" if media_context.startswith("[image shows:") else "Image text (OCR)"
+        media_line = f"{label}: \"{media_context[:400]}\"\n"
     prompt = (
         f"Quote-tweet @{account}:\n\n"
         f"Tweet text: \"{tweet_text[:500]}\"\n"

@@ -57,3 +57,10 @@ x_timeline_like_rt.py
 *.bak.*
 *.bak2
 run_like_retweet.sh
+
+# Playwright session artifacts
+session.tw_session
+*.tw_session
+
+# Dead/legacy wrappers (superseded by direct cron invocation)
+chain_finder_wrapper.sh
