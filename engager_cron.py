@@ -55,7 +55,7 @@ BRIDGE_CONFIG = "/home/hermes/.hermes/bridge_config.json"
 TELEGRAM_CHAT_ID = "-1003641668106"
 TELEGRAM_THREAD = "10"
 MIN_ACTIONS = 1
-MAX_ACTIONS = 2  # quotes are high-visibility, keep conservative
+MAX_ACTIONS = 4  # user requested back to 4 (matches old like_retweet cadence)
 
 # LLM endpoint for quote generation (local 9router)
 LLM_URL = "http://localhost:20128/v1/chat/completions"
