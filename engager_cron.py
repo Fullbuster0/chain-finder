@@ -313,28 +313,31 @@ def snowflake_to_dt(tid):
 
 def generate_quote_text(tweet_text, account):
     """Call local 9router LLM to generate a natural quote response."""
+    system = (
+        "You write quote tweets as a real person on crypto Twitter — not a marketing account, not an AI. "
+        "Output ONLY the quote text. No quotes around it, no explanation."
+    )
     prompt = (
-        f"You are a real crypto/Cosmos ecosystem participant on X (Twitter) who genuinely follows @{account}. "
-        f"They just posted:\n\n"
+        f"You're casually quote-tweeting @{account} on X. Their post:\n\n"
         f"\"{tweet_text[:500]}\"\n\n"
-        f"Write a short quote tweet (1 sentence, max 180 chars) that a real follower would write. "
-        f"Rules:\n"
-        f"- React to the SPECIFIC content: mention the actual project/token/feature/number from the tweet. "
-        f"Do NOT just restate the tweet or ask a rhetorical question about it.\n"
-        f"- Add your own take: why it matters, what you're watching, a concrete observation, or genuine excitement tied to the specific detail.\n"
-        f"- Sound like a human who actually read it. No generic crypto filler like \"bullish\", \"LFG\", \"this is huge\", \"game changer\" unless tied to something specific.\n"
-        f"- No hashtags. At most 1 emoji, only if it fits naturally.\n"
-        f"- Vary your openings — never start with \"The\" + restating the headline.\n"
-        f"Reply with ONLY the quote text, nothing else."
+        f"Write ONE short quote like a real crypto person would type on their phone.\n"
+        f"Hard rules:\n"
+        f"- 8–20 words max. Incomplete sentences OK.\n"
+        f"- Lowercase fine. Mild typos/casual slang fine. No corporate polish.\n"
+        f"- React, don't restate. Don't open with the tweet's headline.\n"
+        f"- No: bullish, LFG, game changer, huge, this is the way, \"makes X feel like\", \"has me sizing\"\n"
+        f"- No hashtags. 0–1 emoji max, usually zero.\n"
+        f"- Sound like a friend in a group chat, not a press release.\n\n"
+        f"Only the quote text:"
     )
     payload = json.dumps({
         "model": LLM_MODEL,
         "messages": [
-            {"role": "system", "content": "You write short, specific, human-sounding X/Twitter quote tweets. You react to the actual content, not generic hype. Output only the quote text."},
+            {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.9,
-        "max_tokens": 120,
+        "temperature": 1.0,
+        "max_tokens": 80,
         "stream": False,
     }).encode()
     try:
