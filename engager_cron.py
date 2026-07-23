@@ -61,6 +61,13 @@ MAX_ACTIONS = 4  # user requested back to 4 (matches old like_retweet cadence)
 # LLM endpoint for quote generation (local 9router)
 LLM_URL = "http://localhost:20128/v1/chat/completions"
 LLM_MODEL = "Knight"
+# Vision model for image description — called BY NAME (NOT via Knight combo)
+# so it never consumes Knight's quota. Used only as fallback when OCR finds no text.
+VISION_MODELS = [
+    "gemini/gemini-3.1-flash-lite-preview",
+    "gemini/gemini-3-flash-preview",
+    "gemini/gemma-4-31b-it",
+]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -142,11 +149,43 @@ def fetch_media_urls_vxtwitter(account, tid):
 
 
 def _parse_llm_json(raw: str):
-    """Parse 9router response; sometimes returns concatenated JSON objects."""
+    """Parse 9router response: normal JSON, concatenated JSON, or SSE stream."""
+    raw = raw.strip()
+    # SSE stream (some providers return 'data: {...}' chunks even with stream=False)
+    if raw.startswith("data:") or "\ndata:" in raw:
+        parts = []
+        finish = None
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            msg = choices[0].get("message") or {}
+            if delta.get("content"):
+                parts.append(delta["content"])
+            if msg.get("content"):
+                parts.append(msg["content"])
+            if choices[0].get("finish_reason"):
+                finish = choices[0]["finish_reason"]
+        text = "".join(parts).strip()
+        if text:
+            return {"choices": [{"message": {"content": text}, "finish_reason": finish}]}
+    # Normal JSON
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
+    # Concatenated JSON objects — take first complete one
     depth = 0
     end = 0
     for i, ch in enumerate(raw):
@@ -160,6 +199,71 @@ def _parse_llm_json(raw: str):
     if end:
         return json.loads(raw[:end])
     raise ValueError(f"unparseable LLM response: {raw[:160]}")
+
+
+def vision_describe_image(url, timeout=40):
+    """Describe an image via a vision model called BY NAME (not Knight combo).
+
+    Returns a short one-line description, or '' if all models fail.
+    Used as fallback when OCR finds no text (memes, photos, artwork).
+    """
+    if not url:
+        return ""
+    # Download + base64 (vision models want inline data or a URL; inline is reliable)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            img_bytes = resp.read()
+        if not img_bytes or len(img_bytes) < 200:
+            return ""
+        import base64
+        mime = "image/jpeg"
+        if img_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+            mime = "image/png"
+        elif img_bytes[:3] == b"GIF":
+            mime = "image/gif"
+        elif img_bytes[:4] == b"RIFF" and img_bytes[8:12] == b"WEBP":
+            mime = "image/webp"
+        b64 = base64.b64encode(img_bytes).decode()
+        data_url = f"data:{mime};base64,{b64}"
+    except Exception as e:
+        logger.warning(f"  vision download fail: {e}")
+        return ""
+
+    prompt = (
+        "Describe this tweet image in ONE short sentence (max 25 words). "
+        "Focus on: product/project name, key numbers/offer, the main message. "
+        "Output only the description."
+    )
+    for model in VISION_MODELS:
+        payload = json.dumps({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }],
+            "max_tokens": 60,
+            "temperature": 0.2,
+            "stream": False,
+        }).encode()
+        try:
+            req = urllib.request.Request(
+                LLM_URL, data=payload,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = _parse_llm_json(resp.read().decode())
+            desc = (data["choices"][0]["message"]["content"] or "").strip()
+            if desc:
+                logger.info(f"  vision [{model}]: {desc[:120]}")
+                return desc[:300]
+        except Exception as e:
+            logger.debug(f"  vision [{model}] fail: {e}")
+            continue
+    return ""
 
 
 def is_active_hours():
@@ -960,7 +1064,8 @@ async def process_quote(page, tweet):
         except Exception:
             pass
 
-    # Media context: OCR attached images (charts, tiers, bonus tables, etc.)
+    # Media context: OCR first (free, local); Gemini vision fallback if OCR empty
+    # Vision is called BY NAME (gemini/*) — never via Knight combo — so Knight quota is safe.
     media_context = ""
     media_urls = []
     try:
@@ -979,7 +1084,7 @@ async def process_quote(page, tweet):
     if not media_urls:
         media_urls = await asyncio.to_thread(fetch_media_urls_vxtwitter, acc, tid)
     if media_urls:
-        logger.info(f"  media for OCR: {len(media_urls)} image(s)")
+        logger.info(f"  media: {len(media_urls)} image(s)")
         parts = []
         for u in media_urls:
             txt = await asyncio.to_thread(ocr_image_url, u)
@@ -988,6 +1093,15 @@ async def process_quote(page, tweet):
         media_context = " || ".join(parts)
         if media_context:
             logger.info(f"  OCR: {media_context[:160]}")
+        else:
+            # OCR found nothing useful (meme/photo/artwork) → Gemini vision
+            logger.info("  OCR empty — trying Gemini vision (not Knight)")
+            desc = await asyncio.to_thread(vision_describe_image, media_urls[0])
+            if desc:
+                media_context = f"[image shows: {desc}]"
+                logger.info(f"  vision: {desc[:160]}")
+            else:
+                logger.info("  vision also empty — quote from caption only")
 
     quote_text = None
     if tweet_text or media_context:
