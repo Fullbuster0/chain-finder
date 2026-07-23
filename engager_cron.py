@@ -313,22 +313,17 @@ def snowflake_to_dt(tid):
 
 def generate_quote_text(tweet_text, account):
     """Call local 9router LLM to generate a natural quote response."""
-    system = (
-        "You write quote tweets as a real person on crypto Twitter — not a marketing account, not an AI. "
-        "Output ONLY the quote text. No quotes around it, no explanation."
-    )
+    system = "Write short natural X quote tweets. Output only the quote text."
     prompt = (
-        f"You're casually quote-tweeting @{account} on X. Their post:\n\n"
+        f"Quote-tweet @{account}:\n\n"
         f"\"{tweet_text[:500]}\"\n\n"
-        f"Write ONE short quote like a real crypto person would type on their phone.\n"
-        f"Hard rules:\n"
-        f"- 8–20 words max. Incomplete sentences OK.\n"
-        f"- Lowercase fine. Mild typos/casual slang fine. No corporate polish.\n"
-        f"- React, don't restate. Don't open with the tweet's headline.\n"
-        f"- No: bullish, LFG, game changer, huge, this is the way, \"makes X feel like\", \"has me sizing\"\n"
-        f"- No hashtags. 0–1 emoji max, usually zero.\n"
-        f"- Sound like a friend in a group chat, not a press release.\n\n"
-        f"Only the quote text:"
+        f"Write one short quote, max 12 words.\n"
+        f"Rules:\n"
+        f"- React to a specific detail (token, number, feature) — don't restate the whole tweet.\n"
+        f"- One clean sentence or fragment. Natural, not slangy, not corporate.\n"
+        f"- No hashtags. No \"tempting\", \"bullish\", \"LFG\", \"game changer\".\n"
+        f"- Don't open with \"The $TOKEN...\" or \"Four days...\".\n"
+        f"Only the quote:"
     )
     payload = json.dumps({
         "model": LLM_MODEL,
@@ -336,8 +331,8 @@ def generate_quote_text(tweet_text, account):
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 1.0,
-        "max_tokens": 80,
+        "temperature": 0.9,
+        "max_tokens": 50,
         "stream": False,
     }).encode()
     try:
