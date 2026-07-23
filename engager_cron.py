@@ -313,7 +313,10 @@ def snowflake_to_dt(tid):
 
 def generate_quote_text(tweet_text, account):
     """Call local 9router LLM to generate a natural quote response."""
-    system = "Write short natural X quote tweets. Output only the quote text."
+    system = (
+        "Write short natural X quote tweets. Output only the quote text. "
+        "Stay positive or neutral. Never mention other projects, never hate, never SARA."
+    )
     prompt = (
         f"Quote-tweet @{account}:\n\n"
         f"\"{tweet_text[:500]}\"\n\n"
@@ -321,6 +324,8 @@ def generate_quote_text(tweet_text, account):
         f"Rules:\n"
         f"- React to a specific detail (token, number, feature) — don't restate the whole tweet.\n"
         f"- One clean sentence or fragment. Natural, not slangy, not corporate.\n"
+        f"- Stay on THIS project only. Never name, compare, or dunk on other chains/tokens/projects.\n"
+        f"- No hate, no insults, no religion/ethnicity/politics (SARA), no drama.\n"
         f"- No hashtags. No \"tempting\", \"bullish\", \"LFG\", \"game changer\".\n"
         f"- Don't open with \"The $TOKEN...\" or \"Four days...\".\n"
         f"Only the quote:"
