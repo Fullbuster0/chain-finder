@@ -1,12 +1,17 @@
 #!/home/hermes/.hermes/hermes-agent/venv/bin/python3
 """
-quote_cron.py — Quote tweet original root posts from Cosmos target accounts.
+quote_cron.py — Engage original root posts from Cosmos target accounts.
 Separate from like_retweet_cron.py — does NOT modify or share state with it.
+
+Engagement priority per tweet:
+  1. Always like
+  2. Prefer LLM-generated quote (natural, contextual — reads tweet body)
+  3. Fallback plain retweet if LLM fails / quote UI fails
+  (Never posts template/canned quote text.)
 
 Flow:
 - Discover via profile + search (same dual-scan as like_retweet)
 - Only original root tweets by target account (never replies / pure reposts)
-- For each selected tweet: read text → LLM generates natural quote → post quote
 - State in quote_queue.json (separate from timeline_queue.json)
 - TG thread 10 notification
 """
@@ -416,82 +421,62 @@ async def click_el(locator, timeout=4000):
             return False
 
 
-async def process_quote(page, tweet):
-    """
-    Navigate to tweet, verify it's a root post, generate quote via LLM, post it.
-    """
-    tid = str(tweet['id'])
-    acc = tweet.get('account', '')
-    if not acc:
-        tweet['quoted'] = False
-        return tweet
+async def do_like(target, first, tweet):
+    """Always like the target article. Returns bool."""
+    if first.get('likeTid') == 'unlike':
+        tweet['liked'] = True
+        logger.info("    already liked")
+        return True
+    like = target.locator('[data-testid="like"]')
+    unlike = target.locator('[data-testid="unlike"]')
+    if await like.count() > 0:
+        await click_el(like.first)
+        await asyncio.sleep(random.uniform(1.0, 1.8))
+        tweet['liked'] = await unlike.count() > 0
+    else:
+        tweet['liked'] = await unlike.count() > 0
+    logger.info(f"    like={'OK' if tweet['liked'] else 'FAIL'}")
+    return tweet['liked']
 
-    url = f"https://x.com/{acc}/status/{tid}"
-    tweet['permalink'] = f"/{acc}/status/{tid}"
-    logger.info(f"  process quote: {url}")
-    await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-    try:
-        await page.wait_for_selector('article', timeout=15000)
-    except Exception:
-        pass
-    await asyncio.sleep(random.uniform(1.0, 1.5))
 
-    arts = page.locator('article')
-    n = await arts.count()
-    if n == 0:
-        logger.error("  no articles")
-        tweet['quoted'] = False
-        return tweet
-
-    # Verify article[0] is the target (not a reply thread)
-    first = await parse_article(arts.nth(0), acc)
-    first_author = (first.get('author') or '').lower()
-    first_tid = str(first.get('tid') or '')
-    if first_author != acc.lower() or first_tid != tid:
-        logger.error(
-            f"  ABORT reply-thread or wrong root: "
-            f"article[0]=@{first.get('author')}/{first_tid} expected=@{acc}/{tid}"
+async def do_retweet(page, target, first, tweet):
+    """Plain repost (fallback when LLM quote unavailable). Returns bool."""
+    if first.get('rtTid') == 'unretweet':
+        tweet['retweeted'] = True
+        logger.info("    already retweeted")
+        return True
+    rt = target.locator('[data-testid="retweet"]')
+    unrt = target.locator('[data-testid="unretweet"]')
+    if await rt.count() == 0:
+        tweet['retweeted'] = await unrt.count() > 0
+        logger.info(f"    rt={'OK' if tweet['retweeted'] else 'FAIL'} (no rt btn)")
+        return tweet['retweeted']
+    await click_el(rt.first)
+    await asyncio.sleep(random.uniform(1.0, 2.0))
+    conf = page.locator('[data-testid="retweetConfirm"]')
+    if await conf.count() == 0:
+        conf = page.locator('div[role="menuitem"]').filter(
+            has_text=re.compile(r'Repost|Posting ulang|Retweet', re.I)
         )
-        tweet['quoted'] = False
-        tweet['skipped'] = 'reply_or_wrong_root'
-        return tweet
+    if await conf.count() > 0:
+        await click_el(conf.first)
+        await asyncio.sleep(random.uniform(1.2, 2.5))
+    tweet['retweeted'] = await unrt.count() > 0
+    logger.info(f"    rt={'OK' if tweet['retweeted'] else 'FAIL'}")
+    return tweet['retweeted']
 
-    target = arts.nth(0)
-    logger.info(f"  target article[0] @{first.get('author')} ok")
 
-    # Get full tweet text for LLM context
-    tweet_text = tweet.get('text', '')
-    if not tweet_text or len(tweet_text) < 10:
-        try:
-            te = target.locator('[data-testid="tweetText"]')
-            if await te.count():
-                tweet_text = (await te.first.inner_text())[:500]
-        except Exception:
-            pass
-
-    # Generate quote text via LLM
-    quote_text = None
-    if tweet_text:
-        quote_text = await asyncio.to_thread(generate_quote_text, tweet_text, acc)
-    if not quote_text:
-        logger.warning("  LLM failed, using fallback")
-        quote_text = f"Solid update from @{acc} 🔥"
-
-    logger.info(f"  quote text: \"{quote_text}\"")
-
-    # Step 1: Click retweet/repost button to open menu
+async def do_quote(page, target, quote_text, tweet):
+    """Open RT menu → Quote/Kutip → type LLM text → submit. Returns bool."""
     rt_btn = target.locator('[data-testid="retweet"], [data-testid="unretweet"]')
     if await rt_btn.count() == 0:
         logger.error("  no retweet button found")
-        tweet['quoted'] = False
-        return tweet
+        return False
 
     await click_el(rt_btn.first)
     await asyncio.sleep(random.uniform(1.0, 2.0))
 
-    # Step 2: Find and click "Quote" / "Kutip" in the dropdown menu
     quote_option = None
-    # Try multiple selectors for the quote menu item
     for selector in [
         'div[role="menuitem"]:has-text("Quote")',
         'div[role="menuitem"]:has-text("Kutip")',
@@ -505,7 +490,6 @@ async def process_quote(page, tweet):
             break
 
     if not quote_option:
-        # Fallback: look for any menuitem containing quote/kutip text
         menuitems = page.locator('div[role="menuitem"]')
         mi_count = await menuitems.count()
         for i in range(mi_count):
@@ -517,18 +501,14 @@ async def process_quote(page, tweet):
 
     if not quote_option:
         logger.error("  Quote/Kutip menu item not found")
-        tweet['quoted'] = False
-        # Close the menu by pressing Escape
         await page.keyboard.press('Escape')
         await asyncio.sleep(0.5)
-        return tweet
+        return False
 
     await click_el(quote_option)
     await asyncio.sleep(random.uniform(1.5, 2.5))
 
-    # Step 3: Find the compose dialog and fill quote text
     compose = None
-    # Try dialog-scoped textarea first
     dialog = page.locator('[role="dialog"]')
     if await dialog.count() > 0:
         textarea = dialog.locator('[data-testid="tweetTextarea_0"]')
@@ -537,19 +517,16 @@ async def process_quote(page, tweet):
             logger.info("  compose found in dialog")
 
     if not compose:
-        # Fallback: any visible tweetTextarea
         compose = page.locator('[data-testid="tweetTextarea_0"]').first
         if await compose.count() == 0:
             compose = page.locator('div[role="textbox"]').first
 
     if not compose or await compose.count() == 0:
         logger.error("  compose textarea not found")
-        tweet['quoted'] = False
         await page.keyboard.press('Escape')
         await asyncio.sleep(0.5)
-        return tweet
+        return False
 
-    # Type the quote text (use type instead of fill for contenteditable)
     try:
         await compose.click()
         await asyncio.sleep(0.3)
@@ -559,16 +536,13 @@ async def process_quote(page, tweet):
             await compose.fill(quote_text)
         except Exception as e:
             logger.error(f"  failed to type quote text: {e}")
-            tweet['quoted'] = False
             await page.keyboard.press('Escape')
-            return tweet
+            return False
 
     logger.info(f"  typed quote text ({len(quote_text)} chars)")
     await asyncio.sleep(random.uniform(0.8, 1.5))
 
-    # Step 4: Find and click the submit button
     submit = None
-    # Try dialog-scoped submit first
     if await dialog.count() > 0:
         for sel in [
             '[data-testid="tweetButton"]',
@@ -579,7 +553,6 @@ async def process_quote(page, tweet):
         ]:
             btn = dialog.locator(sel)
             if await btn.count() > 0:
-                # Check not disabled
                 is_disabled = await btn.first.get_attribute('disabled')
                 aria_disabled = await btn.first.get_attribute('aria-disabled')
                 if is_disabled is None and aria_disabled != 'true':
@@ -588,7 +561,6 @@ async def process_quote(page, tweet):
                     break
 
     if not submit:
-        # Fallback: page-level tweetButton
         for sel in ['[data-testid="tweetButton"]', 'button:has-text("Post")', 'button:has-text("Posting")']:
             btn = page.locator(sel)
             if await btn.count() > 0:
@@ -598,43 +570,113 @@ async def process_quote(page, tweet):
 
     if not submit:
         logger.error("  submit button not found")
-        tweet['quoted'] = False
         await page.keyboard.press('Escape')
-        return tweet
+        return False
 
     await click_el(submit)
     logger.info("  clicked submit")
     await asyncio.sleep(random.uniform(3.0, 5.0))
 
-    # Step 5: Verify quote was posted
-    # Check if dialog closed (success indicator)
     dialog_still = page.locator('[role="dialog"]')
-    dialog_count = await dialog_still.count()
-    if dialog_count == 0:
+    if await dialog_still.count() == 0:
         logger.info("  dialog closed — quote likely posted")
-        tweet['quoted'] = True
         tweet['quote_text'] = quote_text
-    else:
-        # Dialog still open — might have failed
-        # Check for error toast
-        toast = page.locator('[role="status"]')
-        if await toast.count() > 0:
-            toast_text = await toast.first.inner_text()
-            logger.warning(f"  toast after submit: \"{toast_text}\"")
-        # Try checking if textarea is empty (success) or still has text (fail)
-        try:
-            remaining = await compose.inner_text()
-            if not remaining.strip():
-                tweet['quoted'] = True
-                tweet['quote_text'] = quote_text
-                logger.info("  textarea empty after submit — quote posted")
-            else:
-                tweet['quoted'] = False
-                logger.warning("  textarea still has text — quote may have failed")
-        except Exception:
-            tweet['quoted'] = False
-            logger.warning("  could not verify quote status")
+        return True
 
+    toast = page.locator('[role="status"]')
+    if await toast.count() > 0:
+        toast_text = await toast.first.inner_text()
+        logger.warning(f"  toast after submit: \"{toast_text}\"")
+    try:
+        remaining = await compose.inner_text()
+        if not remaining.strip():
+            tweet['quote_text'] = quote_text
+            logger.info("  textarea empty after submit — quote posted")
+            return True
+        logger.warning("  textarea still has text — quote may have failed")
+    except Exception:
+        logger.warning("  could not verify quote status")
+    await page.keyboard.press('Escape')
+    await asyncio.sleep(0.5)
+    return False
+
+
+async def process_quote(page, tweet):
+    """
+    Priority engagement:
+      1. Always like
+      2. Prefer LLM quote (natural, contextual)
+      3. Fallback plain retweet if LLM fails / quote UI fails
+    Never posts template/canned quote text.
+    """
+    tid = str(tweet['id'])
+    acc = tweet.get('account', '')
+    tweet['liked'] = False
+    tweet['quoted'] = False
+    tweet['retweeted'] = False
+    if not acc:
+        return tweet
+
+    url = f"https://x.com/{acc}/status/{tid}"
+    tweet['permalink'] = f"/{acc}/status/{tid}"
+    logger.info(f"  process: {url}")
+    await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+    try:
+        await page.wait_for_selector('article', timeout=15000)
+    except Exception:
+        pass
+    await asyncio.sleep(random.uniform(1.0, 1.5))
+
+    arts = page.locator('article')
+    n = await arts.count()
+    if n == 0:
+        logger.error("  no articles")
+        return tweet
+
+    first = await parse_article(arts.nth(0), acc)
+    first_author = (first.get('author') or '').lower()
+    first_tid = str(first.get('tid') or '')
+    if first_author != acc.lower() or first_tid != tid:
+        logger.error(
+            f"  ABORT reply-thread or wrong root: "
+            f"article[0]=@{first.get('author')}/{first_tid} expected=@{acc}/{tid}"
+        )
+        tweet['skipped'] = 'reply_or_wrong_root'
+        return tweet
+
+    target = arts.nth(0)
+    logger.info(f"  target article[0] @{first.get('author')} ok")
+
+    # 1) Always like
+    await do_like(target, first, tweet)
+
+    # 2) Prefer LLM quote
+    tweet_text = tweet.get('text', '')
+    if not tweet_text or len(tweet_text) < 10:
+        try:
+            te = target.locator('[data-testid="tweetText"]')
+            if await te.count():
+                tweet_text = (await te.first.inner_text())[:500]
+        except Exception:
+            pass
+
+    quote_text = None
+    if tweet_text:
+        quote_text = await asyncio.to_thread(generate_quote_text, tweet_text, acc)
+
+    if quote_text:
+        logger.info(f"  quote text: \"{quote_text}\"")
+        tweet['quoted'] = await do_quote(page, target, quote_text, tweet)
+        if tweet['quoted']:
+            await asyncio.sleep(random.uniform(1.5, 3.0))
+            return tweet
+        logger.warning("  quote UI failed — falling back to plain retweet")
+    else:
+        logger.warning("  LLM failed — falling back to plain retweet (no template)")
+
+    # 3) Fallback: plain retweet (re-parse state after failed quote attempt)
+    first = await parse_article(target, acc)
+    await do_retweet(page, target, first, tweet)
     await asyncio.sleep(random.uniform(1.5, 3.0))
     return tweet
 
@@ -734,25 +776,34 @@ async def main():
                 save_state(state)
                 logger.info(f"  marked reply skipped {tweet['id']}")
                 continue
-            if tweet.get('quoted'):
+            engaged = tweet.get('quoted') or tweet.get('retweeted')
+            if engaged:
                 processed_ids.add(tweet['id'])
                 state['processed'] = list(processed_ids)
                 save_state(state)
                 done.append(tweet)
             else:
-                # Quote failed but not a reply — don't mark processed, allow retry
-                logger.warning(f"  quote failed for {tweet['id']}, not marking processed")
+                # Nothing engaged (like may have worked but no quote/RT) — allow retry
+                logger.warning(f"  no quote/RT for {tweet['id']}, not marking processed")
         except Exception as e:
             logger.error(f"process {tweet['id']}: {e}")
 
     if done:
-        lines = [f"*Quote batch* · {len(done)} tweet"]
+        lines = [f"*Engage batch* · {len(done)} tweet"]
         for t in done:
+            flags = []
+            if t.get('liked'):
+                flags.append('❤️')
+            if t.get('quoted'):
+                flags.append('💬')
+            if t.get('retweeted'):
+                flags.append('🔁')
             qt = t.get('quote_text', '')
+            extra = f" \"{qt[:80]}\"" if qt else ""
             lines.append(
                 f"- @{t.get('account','?')} "
                 f"[{t['id']}](https://x.com/{t.get('account')}/status/{t['id']}) "
-                f"💬 \"{qt[:80]}\""
+                f"{''.join(flags)}{extra}"
             )
         send_telegram('\n'.join(lines))
 
