@@ -314,21 +314,23 @@ def snowflake_to_dt(tid):
 def generate_quote_text(tweet_text, account):
     """Call local 9router LLM to generate a natural quote response."""
     prompt = (
-        f"You are a crypto/Cosmos ecosystem enthusiast on X (Twitter). "
-        f"Someone @{account} just posted this tweet:\n\n"
+        f"You are a real crypto/Cosmos ecosystem participant on X (Twitter) who genuinely follows @{account}. "
+        f"They just posted:\n\n"
         f"\"{tweet_text[:500]}\"\n\n"
-        f"Write a short quote tweet response (1-2 sentences, max 200 chars). "
-        f"Be genuine, varied, and contextual to the tweet content. "
-        f"Sound like a real person, not a bot. No generic filler. "
-        f"Match the energy of the tweet. If it's an announcement, show excitement. "
-        f"If it's technical, acknowledge the substance. "
-        f"Use at most 1 emoji. No hashtags unless the tweet uses them. "
+        f"Write a short quote tweet (1 sentence, max 180 chars) that a real follower would write. "
+        f"Rules:\n"
+        f"- React to the SPECIFIC content: mention the actual project/token/feature/number from the tweet. "
+        f"Do NOT just restate the tweet or ask a rhetorical question about it.\n"
+        f"- Add your own take: why it matters, what you're watching, a concrete observation, or genuine excitement tied to the specific detail.\n"
+        f"- Sound like a human who actually read it. No generic crypto filler like \"bullish\", \"LFG\", \"this is huge\", \"game changer\" unless tied to something specific.\n"
+        f"- No hashtags. At most 1 emoji, only if it fits naturally.\n"
+        f"- Vary your openings — never start with \"The\" + restating the headline.\n"
         f"Reply with ONLY the quote text, nothing else."
     )
     payload = json.dumps({
         "model": LLM_MODEL,
         "messages": [
-            {"role": "system", "content": "You generate short, natural X/Twitter quote tweet responses. Output only the quote text."},
+            {"role": "system", "content": "You write short, specific, human-sounding X/Twitter quote tweets. You react to the actual content, not generic hype. Output only the quote text."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.9,
